@@ -369,7 +369,7 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
   }
 
   return (
-    <div className="backdrop" onClick={e => e.target === e.currentTarget && onClose()}>
+    <div className="backdrop">
       <div className="modal">
 
         {/* Header */}
