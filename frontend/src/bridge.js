@@ -62,7 +62,12 @@ function chooseVaultZip() {
     const input = document.createElement('input')
     input.type = 'file'
     input.accept = '.zip,application/zip'
-    input.style.display = 'none'
+    // Keep the input in the document but visually hidden. Safari can ignore
+    // programmatic clicks on an element with display:none.
+    input.style.position = 'fixed'
+    input.style.left = '-10000px'
+    input.style.top = '0'
+    input.style.opacity = '0'
     let finished = false
     const finish = file => {
       if (finished) return
