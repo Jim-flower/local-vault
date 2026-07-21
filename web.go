@@ -7,13 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type webRequest struct {
@@ -29,6 +33,8 @@ type webSession struct {
 	Token     string `json:"token"`
 	Workspace bool   `json:"workspace"`
 }
+
+const maxVaultUploadSize = 16 << 20
 
 func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, allowRemote bool) error {
 	if port < 1024 || port > 65535 {
@@ -108,8 +114,101 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(webSession{Token: token, Workspace: workspaceEnabled})
 	})
+	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeWebRequest(r, token, allowRemote) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "Invalid export request"})
+			return
+		}
+		if app.store == nil {
+			writeWebJSON(w, http.StatusServiceUnavailable, webResponse{Error: "store not available"})
+			return
+		}
+		tempDirectory, err := os.MkdirTemp("", "devhub-export-*")
+		if err != nil {
+			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
+			return
+		}
+		defer os.RemoveAll(tempDirectory)
+		filename := "vault-export-" + time.Now().Format("20060102") + ".zip"
+		path := filepath.Join(tempDirectory, filename)
+		count, err := app.store.ExportToZIP(path, request.Password)
+		if err != nil {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-DevHub-Entry-Count", strconv.Itoa(count))
+		_, _ = w.Write(data)
+	})
+	mux.HandleFunc("/api/import", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeWebRequest(r, token, allowRemote) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if app.store == nil {
+			writeWebJSON(w, http.StatusServiceUnavailable, webResponse{Error: "store not available"})
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxVaultUploadSize)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "The import ZIP is invalid or too large"})
+			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "Choose a Vault export ZIP file"})
+			return
+		}
+		defer file.Close()
+		temp, err := os.CreateTemp("", ".vault-import-*.zip")
+		if err != nil {
+			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
+			return
+		}
+		tempPath := temp.Name()
+		defer os.Remove(tempPath)
+		written, copyErr := io.Copy(temp, io.LimitReader(file, maxVaultUploadSize+1))
+		closeErr := temp.Close()
+		if copyErr != nil || closeErr != nil || written > maxVaultUploadSize {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "The import ZIP is invalid or too large"})
+			return
+		}
+		result, err := app.store.ImportFromZIP(tempPath, r.FormValue("password"))
+		if err != nil {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
+			return
+		}
+		result.Path = filepath.Base(header.Filename)
+		writeWebJSON(w, http.StatusOK, webResponse{Result: result})
+	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if (!allowRemote && !isLoopbackRequest(r)) || !validWebToken(r.Header.Get("X-DevHub-Token"), token) {
+		if !authorizeWebRequest(r, token, allowRemote) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -153,6 +252,10 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 		_, _ = w.Write(index)
 	})
 	return mux
+}
+
+func authorizeWebRequest(request *http.Request, token string, allowRemote bool) bool {
+	return (allowRemote || isLoopbackRequest(request)) && validWebToken(request.Header.Get("X-DevHub-Token"), token)
 }
 
 func isWorkspaceWebMethod(method string) bool {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io/fs"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -155,5 +156,69 @@ func TestVaultOnlyWebRouterHidesAndRejectsWorkspace(t *testing.T) {
 	router.ServeHTTP(vaultResponse, vaultRequest)
 	if vaultResponse.Code != http.StatusOK {
 		t.Fatalf("Vault status = %d, body = %s", vaultResponse.Code, vaultResponse.Body.String())
+	}
+}
+
+func TestWebVaultExportImportRoundTrip(t *testing.T) {
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newWebTestApp(t)
+	if err := source.store.Initialize("source-master-password"); err != nil {
+		t.Fatal(err)
+	}
+	categories, err := source.store.GetCategories()
+	if err != nil || len(categories) == 0 {
+		t.Fatalf("GetCategories: %v", err)
+	}
+	if err := source.store.AddEntry(categories[0].ID, "migration entry", "user", "secret", "", "note", ""); err != nil {
+		t.Fatal(err)
+	}
+	sourceRouter := webRouter(source, "source-token", webFS, true, false)
+	exportRequest := httptest.NewRequest(http.MethodPost, "/api/export", bytes.NewBufferString(`{"password":"archive-password"}`))
+	exportRequest.RemoteAddr = "192.0.2.10:12345"
+	exportRequest.Header.Set("X-DevHub-Token", "source-token")
+	exportResponse := httptest.NewRecorder()
+	sourceRouter.ServeHTTP(exportResponse, exportRequest)
+	if exportResponse.Code != http.StatusOK {
+		t.Fatalf("export status = %d, body = %s", exportResponse.Code, exportResponse.Body.String())
+	}
+	if exportResponse.Header().Get("Content-Type") != "application/zip" || !bytes.HasPrefix(exportResponse.Body.Bytes(), []byte("PK")) {
+		t.Fatal("export did not return a ZIP download")
+	}
+
+	target := newWebTestApp(t)
+	if err := target.store.Initialize("target-master-password"); err != nil {
+		t.Fatal(err)
+	}
+	targetRouter := webRouter(target, "target-token", webFS, true, false)
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	if err := multipartWriter.WriteField("password", "archive-password"); err != nil {
+		t.Fatal(err)
+	}
+	fileWriter, err := multipartWriter.CreateFormFile("file", "vault-export.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileWriter.Write(exportResponse.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := multipartWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	importRequest := httptest.NewRequest(http.MethodPost, "/api/import", &body)
+	importRequest.RemoteAddr = "192.0.2.10:12345"
+	importRequest.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	importRequest.Header.Set("X-DevHub-Token", "target-token")
+	importResponse := httptest.NewRecorder()
+	targetRouter.ServeHTTP(importResponse, importRequest)
+	if importResponse.Code != http.StatusOK {
+		t.Fatalf("import status = %d, body = %s", importResponse.Code, importResponse.Body.String())
+	}
+	entries, err := target.store.ListEntries(0)
+	if err != nil || len(entries) != 1 || entries[0].Name != "migration entry" || entries[0].Password != "secret" {
+		t.Fatalf("unexpected imported entries: %#v, %v", entries, err)
 	}
 }
