@@ -1,0 +1,17 @@
+.git
+.gitignore
+.idea
+.claude
+.env
+build
+frontend/dist
+frontend/node_modules
+/*.exe
+/*.zip
+/*.pdf
+/*.png
+*.log
+Dockerfile*
+compose*.yaml
+PACKAGING.md
+GUIDE.md

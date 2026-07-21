@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
-	ctx   context.Context
-	store *Store
+	ctx          context.Context
+	store        *Store
+	projectStore *ProjectStore
+	webMode      bool
 }
 
 func NewApp() *App { return &App{} }
@@ -20,11 +26,26 @@ func (a *App) startup(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	projects, err := OpenProjectStore(filepath.Join(home, ".devhub.db"))
+	if err != nil {
+		return
+	}
+	a.projectStore = projects
+
 	s, err := OpenStore(filepath.Join(home, ".vault.db"))
 	if err != nil {
 		return
 	}
 	a.store = s
+}
+
+func (a *App) shutdown(ctx context.Context) {
+	if a.store != nil {
+		_ = a.store.Close()
+	}
+	if a.projectStore != nil {
+		_ = a.projectStore.Close()
+	}
 }
 
 func (a *App) IsInitialized() bool {
@@ -106,14 +127,14 @@ func (a *App) SearchEntries(query string) ([]*Entry, error) {
 	return a.store.SearchEntries(query)
 }
 
-func (a *App) AddEntry(categoryID int64, name, username, password, url, notes string) error {
+func (a *App) AddEntry(categoryID int64, name, username, password, url, notes, totpSecret string) error {
 	if a.store == nil {
 		return fmt.Errorf("store not available")
 	}
-	return a.store.AddEntry(categoryID, name, username, password, url, notes)
+	return a.store.AddEntry(categoryID, name, username, password, url, notes, totpSecret)
 }
 
-func (a *App) UpdateEntry(oldName string, categoryID int64, name, username, password, url, notes string) error {
+func (a *App) UpdateEntry(oldName string, categoryID int64, name, username, password, url, notes, totpSecret string) error {
 	if a.store == nil {
 		return fmt.Errorf("store not available")
 	}
@@ -127,16 +148,154 @@ func (a *App) UpdateEntry(oldName string, categoryID int64, name, username, pass
 	existing.Password = password
 	existing.URL = url
 	existing.Notes = notes
+	existing.TOTPSecret = totpSecret
 	return a.store.SaveEntry(existing)
 }
 
-func (a *App) DeleteEntry(name string) error {
+func (a *App) GetEntryHistory(entryName string) ([]*EntryHistory, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not available")
+	}
+	return a.store.GetEntryHistory(entryName)
+}
+
+func (a *App) GetTOTPCode(entryName string) (*TOTPResult, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not available")
+	}
+	entry, err := a.store.GetEntry(entryName)
+	if err != nil {
+		return nil, err
+	}
+	if entry.TOTPSecret == "" {
+		return nil, fmt.Errorf("该条目未配置 TOTP 密钥")
+	}
+	return GenerateTOTP(entry.TOTPSecret)
+}
+
+// DeleteEntries performs the irreversible deletion only after re-validating
+// the master password. The PlayCaptcha step is enforced by the UI immediately
+// before this method is called.
+func (a *App) DeleteEntries(names []string, masterPassword string) error {
 	if a.store == nil {
 		return fmt.Errorf("store not available")
 	}
-	return a.store.DeleteEntry(name)
+	return a.store.DeleteEntries(names, masterPassword)
+}
+
+// ExportVault prompts for a destination and writes an AES-256 encrypted ZIP.
+// A nil result means the user dismissed the file picker.
+func (a *App) ExportVault(exportPassword string) (*ExportResult, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not available")
+	}
+	filename := "vault-export-" + time.Now().Format("20060102") + ".zip"
+	var path string
+	var err error
+	if a.webMode {
+		path, err = chooseSaveFileForWeb(filename)
+	} else {
+		path, err = runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+			Title:           "导出加密密码库",
+			DefaultFilename: filename,
+			Filters: []runtime.FileFilter{{
+				DisplayName: "加密 ZIP 文件 (*.zip)",
+				Pattern:     "*.zip",
+			}},
+		})
+	}
+	if err != nil || path == "" {
+		return nil, err
+	}
+	if !strings.EqualFold(filepath.Ext(path), ".zip") {
+		path += ".zip"
+	}
+	count, err := a.store.ExportToZIP(path, exportPassword)
+	if err != nil {
+		return nil, err
+	}
+	return &ExportResult{Path: path, EntryCount: count}, nil
+}
+
+// ImportVault prompts for an AES-encrypted Vault ZIP and merges its entries.
+// Existing entries with the same name are left untouched and reported as skipped.
+func (a *App) ImportVault(zipPassword string) (*ImportResult, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not available")
+	}
+	var path string
+	var err error
+	if a.webMode {
+		path, err = chooseOpenFileForWeb()
+	} else {
+		path, err = runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+			Title: "选择要导入的 Vault ZIP 文件",
+			Filters: []runtime.FileFilter{{
+				DisplayName: "加密 ZIP 文件 (*.zip)",
+				Pattern:     "*.zip",
+			}},
+		})
+	}
+	if err != nil || path == "" {
+		return nil, err
+	}
+	return a.store.ImportFromZIP(path, zipPassword)
 }
 
 func (a *App) GeneratePassword(length int) (string, error) {
 	return generatePassword(length)
+}
+
+// ── Project workbench ─────────────────────────────────────────────────────
+
+func (a *App) ListProjects() ([]*Project, error) {
+	if a.projectStore == nil {
+		return nil, fmt.Errorf("project workbench is not available")
+	}
+	return a.projectStore.List()
+}
+
+func (a *App) AddProject(name, path, description, tags string) (int64, error) {
+	if a.projectStore == nil {
+		return 0, fmt.Errorf("project workbench is not available")
+	}
+	return a.projectStore.Add(name, path, description, tags)
+}
+
+func (a *App) UpdateProject(id int64, name, path, description, tags string) error {
+	if a.projectStore == nil {
+		return fmt.Errorf("project workbench is not available")
+	}
+	return a.projectStore.Update(id, name, path, description, tags)
+}
+
+func (a *App) DeleteProject(id int64) error {
+	if a.projectStore == nil {
+		return fmt.Errorf("project workbench is not available")
+	}
+	return a.projectStore.Delete(id)
+}
+
+func (a *App) ChooseProjectDirectory() (string, error) {
+	if a.webMode {
+		return chooseDirectoryForWeb()
+	}
+	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "选择项目文件夹"})
+}
+
+func (a *App) OpenProject(id int64) error {
+	if a.projectStore == nil {
+		return fmt.Errorf("project workbench is not available")
+	}
+	return a.projectStore.Open(id)
+}
+
+func (a *App) OpenProjectWith(id int64, target string) error {
+	if a.projectStore == nil {
+		return fmt.Errorf("project workbench is not available")
+	}
+	if a.webMode && os.Getenv("DEVHUB_CONTAINER") == "1" {
+		return fmt.Errorf("host applications cannot be opened from the container; run DevHub directly on macOS to use Open with")
+	}
+	return a.projectStore.OpenWith(id, target)
 }

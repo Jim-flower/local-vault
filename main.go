@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"flag"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -13,6 +18,21 @@ import (
 var assets embed.FS
 
 func main() {
+	webMode := flag.Bool("web", false, "serve DevHub in the default browser")
+	host := flag.String("host", "127.0.0.1", "web server listen address")
+	port := flag.Int("port", 8787, "local web server port")
+	remoteVaultPort := flag.Int("remote-vault-port", 0, "optional Vault-only port for other devices")
+	noOpen := flag.Bool("no-open", false, "do not open the browser automatically")
+	allowRemote := flag.Bool("allow-remote", false, "allow token-authenticated requests forwarded by a container runtime")
+	flag.Parse()
+	if *webMode || strings.Contains(strings.ToLower(filepath.Base(os.Args[0])), "web-server") {
+		app := NewApp()
+		if err := runWebMode(app, *host, *port, *remoteVaultPort, !*noOpen, *allowRemote); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	app := NewApp()
 	err := wails.Run(&options.App{
 		Title:     "Vault",
@@ -25,9 +45,12 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 245, G: 247, B: 250, A: 1},
 		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
 		Bind:             []interface{}{app},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
+
+func webStartupContext() context.Context { return context.Background() }
