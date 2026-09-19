@@ -1,9 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,11 +26,6 @@ type webResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type webSession struct {
-	Token     string `json:"token"`
-	Workspace bool   `json:"workspace"`
-}
-
 const maxVaultUploadSize = 16 << 20
 
 func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, allowRemote bool) error {
@@ -51,16 +43,12 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	app.startup(webStartupContext())
 	defer app.shutdown(webStartupContext())
 
-	token, err := randomWebToken()
-	if err != nil {
-		return err
-	}
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		return fmt.Errorf("load web assets: %w", err)
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
-	servers := []*http.Server{{Addr: address, Handler: webRouter(app, token, webFS, allowRemote, true)}}
+	servers := []*http.Server{{Addr: address, Handler: webRouter(app, "", webFS, allowRemote, true)}}
 	browserHost := host
 	if host == "0.0.0.0" || host == "::" {
 		browserHost = "127.0.0.1"
@@ -73,14 +61,10 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 		}
 	}
 	if remoteVaultPort != 0 {
-		remoteToken, err := randomWebToken()
-		if err != nil {
-			return err
-		}
 		remoteAddress := net.JoinHostPort(host, strconv.Itoa(remoteVaultPort))
 		servers = append(servers, &http.Server{
 			Addr:    remoteAddress,
-			Handler: webRouter(app, remoteToken, webFS, allowRemote, false),
+			Handler: webRouter(app, "", webFS, allowRemote, false),
 		})
 		log.Printf("DevHub Vault-only access is listening on %s", remoteAddress)
 	}
@@ -99,28 +83,25 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	return err
 }
 
-func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnabled bool) http.Handler {
+func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bool) http.Handler {
+	sessions := app.browserSessionStore()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !allowRemote && !isLoopbackRequest(r) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(webSession{Token: token, Workspace: workspaceEnabled})
+	mux.HandleFunc("/api/auth", func(w http.ResponseWriter, r *http.Request) {
+		handleWebAuth(app, sessions, allowRemote, workspaceEnabled, w, r)
+	})
+	mux.HandleFunc("/api/auth/", func(w http.ResponseWriter, r *http.Request) {
+		handleWebAuth(app, sessions, allowRemote, workspaceEnabled, w, r)
 	})
 	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeWebRequest(r, token, allowRemote) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		if !remoteWebAccessAllowed(r, allowRemote) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
 			return
 		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if _, _, ok := requireUnlockedVault(w, r, app, sessions); !ok {
 			return
 		}
 		var request struct {
@@ -160,12 +141,15 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 		_, _ = w.Write(data)
 	})
 	mux.HandleFunc("/api/import", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeWebRequest(r, token, allowRemote) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		if !remoteWebAccessAllowed(r, allowRemote) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
 			return
 		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if _, _, ok := requireUnlockedVault(w, r, app, sessions); !ok {
 			return
 		}
 		if app.store == nil {
@@ -208,8 +192,8 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 		writeWebJSON(w, http.StatusOK, webResponse{Result: result})
 	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeWebRequest(r, token, allowRemote) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		if !remoteWebAccessAllowed(r, allowRemote) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -217,9 +201,48 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 			return
 		}
 		method := strings.TrimPrefix(r.URL.Path, "/api/")
+		session, token, ok := requireBrowserSession(w, r, sessions)
+		if !ok {
+			return
+		}
 		if !workspaceEnabled && isWorkspaceWebMethod(method) {
 			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "Workspace is available only on the host computer"})
 			return
+		}
+		if method == "IsUnlocked" {
+			writeWebJSON(w, http.StatusOK, webResponse{Result: session.VaultUnlocked && app.IsUnlocked()})
+			return
+		}
+		if method == "Lock" {
+			app.Lock()
+			sessions.lockAll()
+			writeWebJSON(w, http.StatusOK, webResponse{})
+			return
+		}
+		if method == "Unlock" {
+			var unlock webRequest
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&unlock); err != nil || len(unlock.Args) != 1 {
+				writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "invalid unlock request"})
+				return
+			}
+			var masterPassword string
+			if err := json.Unmarshal(unlock.Args[0], &masterPassword); err != nil || app.Unlock(masterPassword) != nil {
+				writeWebJSON(w, http.StatusUnauthorized, webResponse{Error: "incorrect master password"})
+				return
+			}
+			sessions.setVaultUnlocked(token, true)
+			writeWebJSON(w, http.StatusOK, webResponse{})
+			return
+		}
+		if method == "Initialize" {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "complete the administrator setup first"})
+			return
+		}
+		if method != "IsInitialized" && !isWorkspaceWebMethod(method) {
+			if !session.VaultUnlocked || !app.IsUnlocked() {
+				writeWebJSON(w, http.StatusLocked, webResponse{Error: "unlock the vault to continue"})
+				return
+			}
 		}
 		var request webRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&request); err != nil {
@@ -237,6 +260,11 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 	files := http.FileServer(http.FS(webFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if isSecureWebRequest(r) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		if r.URL.Path != "/" {
 			if _, err := fs.Stat(webFS, strings.TrimPrefix(r.URL.Path, "/")); err == nil {
 				files.ServeHTTP(w, r)
@@ -252,10 +280,6 @@ func webRouter(app *App, token string, webFS fs.FS, allowRemote, workspaceEnable
 		_, _ = w.Write(index)
 	})
 	return mux
-}
-
-func authorizeWebRequest(request *http.Request, token string, allowRemote bool) bool {
-	return (allowRemote || isLoopbackRequest(request)) && validWebToken(request.Header.Get("X-DevHub-Token"), token)
 }
 
 func isWorkspaceWebMethod(method string) bool {
@@ -396,22 +420,9 @@ func writeWebJSON(w http.ResponseWriter, status int, response webResponse) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(response)
 }
-func randomWebToken() (string, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes), nil
-}
 func isLoopbackRequest(request *http.Request) bool {
 	host, _, err := net.SplitHostPort(request.RemoteAddr)
 	return err == nil && net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
-}
-func validWebToken(received, expected string) bool {
-	if received == "" || expected == "" || len(received) != len(expected) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(received), []byte(expected)) == 1
 }
 func openDefaultBrowser(url string) error {
 	return exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", url).Start()

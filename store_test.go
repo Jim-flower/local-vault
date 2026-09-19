@@ -52,6 +52,41 @@ func TestDeleteEntriesRequiresPasswordAndIsAtomic(t *testing.T) {
 	}
 }
 
+func TestUserAccountsRequireAdminBootstrapAndStrongPasswords(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "vault.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.CreateFirstSuperAdmin("owner", "long-enough-password"); err == nil {
+		t.Fatal("accepted a first administrator username other than admin")
+	}
+	if err := store.CreateFirstSuperAdmin("admin", "short"); err == nil {
+		t.Fatal("accepted a short administrator password")
+	}
+	if err := store.CreateFirstSuperAdmin("admin", "admin-account-password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateUser("admin", "wrong-password"); err == nil {
+		t.Fatal("accepted incorrect administrator password")
+	}
+	admin, err := store.AuthenticateUser("admin", "admin-account-password")
+	if err != nil || admin.Role != superAdminRole {
+		t.Fatalf("AuthenticateUser admin = %#v, %v", admin, err)
+	}
+	member, err := store.CreateUser("alice", "member-account-password")
+	if err != nil || member.Role != memberRole {
+		t.Fatalf("CreateUser = %#v, %v", member, err)
+	}
+	if err := store.DeleteUser(admin.ID); err == nil {
+		t.Fatal("deleted the super administrator")
+	}
+	if err := store.DeleteUser(member.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEncryptedZIPExportAndImport(t *testing.T) {
 	const masterPassword = "correct horse battery staple"
 	const exportPassword = "portable backup password"

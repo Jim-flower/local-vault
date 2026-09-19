@@ -1,42 +1,34 @@
 import * as wails from '../wailsjs/go/main/App'
 
+// Vite's BASE_URL is derived from VITE_BASE_PATH and always includes the
+// trailing slash. Keeping all browser requests behind this helper lets a
+// gateway mount the app below a path while the Go server still sees /api/.
+export const BASE_PATH = import.meta.env.BASE_URL || '/'
+export function withBasePath(path) {
+  return `${BASE_PATH}${String(path).replace(/^\/+/, '')}`
+}
+
 function inWails() {
   return typeof window !== 'undefined' && Boolean(window.go?.main?.App)
 }
 
-let webSessionPromise
-
-async function webSession() {
-  if (!webSessionPromise) {
-    webSessionPromise = fetch('/api/session', { cache: 'no-store' })
-      .then(async response => {
-        const payload = await response.json().catch(() => ({}))
-        if (!response.ok || !payload.token) throw new Error('Could not start the local web session')
-        return payload
-      })
-      .catch(error => {
-        webSessionPromise = undefined
-        throw error
-      })
-  }
-  return webSessionPromise
-}
-
-async function webToken() {
-  const session = await webSession()
-  return session.token
-}
-
 async function invoke(method, args) {
   if (inWails()) return wails[method](...args)
-  const token = await webToken()
-  const response = await fetch(`/api/${method}`, {
+  const response = await fetch(withBasePath(`api/${method}`), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-DevHub-Token': token },
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify({ args }),
   })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok || payload.error) throw new Error(payload.error || 'Local API request failed')
+  return payload.result
+}
+
+async function auth(path, options = {}) {
+  const response = await fetch(withBasePath(`api/auth${path}`), { credentials: 'same-origin', ...options })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok || payload.error) throw new Error(payload.error || 'Authentication request failed')
   return payload.result
 }
 
@@ -86,10 +78,27 @@ function chooseVaultZip() {
 }
 
 export const IsInitialized = () => invoke('IsInitialized', [])
+export const IsWebApp = () => !inWails()
+export const GetAuthStatus = async () => {
+  if (inWails()) return null
+  return auth('/status')
+}
+export const BootstrapAdmin = (username, password, masterPassword) => auth('/bootstrap', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, masterPassword }),
+})
+export const Login = (username, password) => auth('/login', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
+})
+export const Logout = () => auth('/logout', { method: 'POST' })
+export const ListUsers = () => auth('/users')
+export const CreateUser = (username, password) => auth('/users/create', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
+})
+export const RemoveUser = id => auth(`/users/${id}`, { method: 'DELETE' })
 export const GetWebCapabilities = async () => {
   if (inWails()) return { workspace: true }
-  const session = await webSession()
-  return { workspace: session.workspace !== false }
+  const status = await GetAuthStatus()
+  return { workspace: status.workspace !== false }
 }
 export const IsUnlocked = () => invoke('IsUnlocked', [])
 export const Initialize = (...args) => invoke('Initialize', args)
@@ -109,10 +118,9 @@ export const GetTOTPCode = (...args) => invoke('GetTOTPCode', args)
 export const GetEntryHistory = (...args) => invoke('GetEntryHistory', args)
 export const ExportVault = async exportPassword => {
   if (inWails()) return wails.ExportVault(exportPassword)
-  const token = await webToken()
-  const response = await fetch('/api/export', {
+  const response = await fetch(withBasePath('api/export'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-DevHub-Token': token },
+    headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
     body: JSON.stringify({ password: exportPassword }),
   })
   if (!response.ok) throw await webError(response, 'Vault export failed')
@@ -127,13 +135,12 @@ export const ImportVault = async zipPassword => {
   if (inWails()) return wails.ImportVault(zipPassword)
   const file = await chooseVaultZip()
   if (!file) return null
-  const token = await webToken()
   const form = new FormData()
   form.append('password', zipPassword)
   form.append('file', file, file.name)
-  const response = await fetch('/api/import', {
+  const response = await fetch(withBasePath('api/import'), {
     method: 'POST',
-    headers: { 'X-DevHub-Token': token },
+    credentials: 'same-origin',
     body: form,
   })
   if (!response.ok) throw await webError(response, 'Vault import failed')

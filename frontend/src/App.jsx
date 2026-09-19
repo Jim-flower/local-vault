@@ -3,22 +3,53 @@ import { ClawCaptcha } from 'playcaptcha'
 import 'playcaptcha/clawcaptcha.css'
 import {
   IsInitialized, IsUnlocked, Initialize, Unlock, Lock,
-  GetWebCapabilities,
+  GetWebCapabilities, GetAuthStatus, BootstrapAdmin, Login, Logout, IsWebApp,
+  withBasePath,
   GetCategories, AddCategory, DeleteCategory,
   ListEntries, SearchEntries, AddEntry, UpdateEntry, DeleteEntries,
   GeneratePassword, GetTOTPCode, GetEntryHistory, ExportVault, ImportVault,
   ListProjects, AddProject, UpdateProject, DeleteProject, ChooseProjectDirectory, OpenProjectWith,
+  ListUsers, CreateUser, RemoveUser,
 } from './bridge'
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const input = document.createElement('textarea')
+  input.value = text
+  input.setAttribute('readonly', '')
+  input.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0'
+  document.body.appendChild(input)
+  input.select()
+  input.setSelectionRange(0, input.value.length)
+  const copied = document.execCommand('copy')
+  input.remove()
+  if (!copied) throw new Error('Clipboard access was denied')
+}
 
 // ── Root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [screen, setScreen] = useState('loading')
   const [workspaceEnabled, setWorkspaceEnabled] = useState(true)
+  const [currentUser, setCurrentUser] = useState(null)
+  const webApp = IsWebApp()
 
   useEffect(() => {
-    GetWebCapabilities()
-      .then(async capabilities => {
+    GetAuthStatus()
+      .then(async status => {
+        if (status) {
+          setWorkspaceEnabled(status.workspace !== false)
+          setCurrentUser(status.user || null)
+          if (status.bootstrap) { setScreen('admin-setup'); return }
+          if (!status.authenticated) { setScreen('login'); return }
+          setScreen(status.vaultUnlocked ? 'vault' : 'locked')
+          return
+        }
+        const capabilities = await GetWebCapabilities()
         const enabled = capabilities.workspace !== false
         setWorkspaceEnabled(enabled)
         if (enabled) setScreen('workbench')
@@ -36,9 +67,11 @@ export default function App() {
   }
 
   if (screen === 'loading') return <Splash />
+  if (screen === 'admin-setup') return <AdminSetupScreen onDone={user => { setCurrentUser(user); setScreen('vault') }} />
+  if (screen === 'login') return <LoginScreen onDone={user => { setCurrentUser(user); setScreen('locked') }} />
   if (screen === 'setup')   return <LockScreen mode="setup"  onDone={() => setScreen('vault')} onCancel={() => setScreen('workbench')} canGoBack={workspaceEnabled} />
   if (screen === 'locked')  return <LockScreen mode="unlock" onDone={() => setScreen('vault')} onCancel={() => setScreen('workbench')} canGoBack={workspaceEnabled} />
-  if (screen === 'vault')   return <VaultScreen onLock={() => setScreen(workspaceEnabled ? 'workbench' : 'locked')} onOpenWorkbench={() => setScreen('workbench')} workspaceEnabled={workspaceEnabled} />
+  if (screen === 'vault')   return <VaultScreen user={currentUser} onLogout={async () => { await Logout(); setCurrentUser(null); setScreen('login') }} onLock={() => setScreen(webApp ? 'locked' : workspaceEnabled ? 'workbench' : 'locked')} onOpenWorkbench={() => setScreen('workbench')} workspaceEnabled={workspaceEnabled} />
   return <ProjectWorkbench onOpenVault={openVault} />
 }
 
@@ -51,6 +84,63 @@ function Splash() {
       <div className="spinner" />
     </div>
   )
+}
+
+function AuthShell({ title, subtitle, children }) {
+  return <div className="lock-bg"><main className="lock-card auth-card"><div className="lock-mark">&#128272;</div><h1>{title}</h1><p className="lock-sub">{subtitle}</p>{children}</main></div>
+}
+
+function LoginScreen({ onDone }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function submit(event) {
+    event.preventDefault(); setError(''); setBusy(true)
+    try { const result = await Login(username, password); onDone(result.User) }
+    catch (err) { setError(String(err)) }
+    finally { setBusy(false) }
+  }
+  return <AuthShell title="Sign in" subtitle="Use your Vault account to continue.">
+    <form onSubmit={submit}>
+      <Field label="Username" value={username} onChange={event => setUsername(event.target.value)} autoFocus disabled={busy} />
+      <Field label="Account password" type="password" value={password} onChange={event => setPassword(event.target.value)} disabled={busy} />
+      {error && <div className="err-box">{error}</div>}
+      <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
+    </form>
+  </AuthShell>
+}
+
+function AdminSetupScreen({ onDone }) {
+  const [accountPassword, setAccountPassword] = useState('')
+  const [accountConfirm, setAccountConfirm] = useState('')
+  const [masterPassword, setMasterPassword] = useState('')
+  const [masterConfirm, setMasterConfirm] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function submit(event) {
+    event.preventDefault(); setError('')
+    if (accountPassword.length < 12) { setError('Account password must be at least 12 characters.'); return }
+    if (accountPassword !== accountConfirm) { setError('Account passwords do not match.'); return }
+    if (!masterPassword) { setError('Enter a vault master password.'); return }
+    if (masterPassword !== masterConfirm) { setError('Master passwords do not match.'); return }
+    setBusy(true)
+    try { const result = await BootstrapAdmin('admin', accountPassword, masterPassword); onDone(result.User) }
+    catch (err) { setError(String(err)) }
+    finally { setBusy(false) }
+  }
+  return <AuthShell title="Secure Vault setup" subtitle="Create the admin account and the vault master password. Both are required.">
+    <form onSubmit={submit}>
+      <div className="account-name">Administrator account: <strong>admin</strong></div>
+      <Field label="Admin account password" type="password" value={accountPassword} onChange={event => setAccountPassword(event.target.value)} autoFocus disabled={busy} />
+      <Field label="Confirm account password" type="password" value={accountConfirm} onChange={event => setAccountConfirm(event.target.value)} disabled={busy} />
+      <div className="form-divider">Vault encryption</div>
+      <Field label="Vault master password" type="password" value={masterPassword} onChange={event => setMasterPassword(event.target.value)} disabled={busy} />
+      <Field label="Confirm master password" type="password" value={masterConfirm} onChange={event => setMasterConfirm(event.target.value)} disabled={busy} />
+      {error && <div className="err-box">{error}</div>}
+      <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Creating...' : 'Create secure vault'}</button>
+    </form>
+  </AuthShell>
 }
 
 // ── LockScreen ────────────────────────────────────────────────────────────────
@@ -111,7 +201,7 @@ function LockScreen({ mode, onDone, onCancel, canGoBack }) {
 
 // ── VaultScreen ───────────────────────────────────────────────────────────────
 
-function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
+function VaultScreen({ user, onLogout, onLock, onOpenWorkbench, workspaceEnabled }) {
   const [categories, setCategories] = useState([])
   const [activeCat,  setActiveCat]  = useState(0)     // 0 = All
   const [entries,    setEntries]    = useState([])
@@ -123,6 +213,7 @@ function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
   const [selectedNames, setSelectedNames] = useState([])
   const [deleteTargets, setDeleteTargets] = useState(null)
   const [transferMode, setTransferMode] = useState(null) // null | 'export' | 'import'
+  const [userManagerOpen, setUserManagerOpen] = useState(false)
 
   useEffect(() => { loadCategories() }, [])
   useEffect(() => { if (!search.trim()) loadEntries() }, [activeCat])
@@ -239,7 +330,10 @@ function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
       <aside className="sidebar">
         <div className="sb-top">
           <span className="brand">◈ DevHub</span>
-          <button className="icon-btn" title="Lock vault" onClick={async () => { await Lock(); onLock() }}>⏏</button>
+          <div className="sidebar-actions">
+            {user?.Role === 'superadmin' && <button className="icon-btn" title="Manage users" onClick={() => setUserManagerOpen(true)}>⚙</button>}
+            <button className="icon-btn" title="Lock vault" onClick={async () => { await Lock(); onLock() }}>⏏</button>
+          </div>
         </div>
 
         <div className="module-nav">
@@ -296,6 +390,7 @@ function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
           ) : (
             <button className="new-cat-btn" onClick={() => setNewCatMode(true)}>＋ New Category</button>
           )}
+          {user && <div className="signed-in-user"><span>{user.Username}</span><button onClick={onLogout}>Sign out</button></div>}
         </div>
       </aside>
 
@@ -382,7 +477,10 @@ function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
                       <button
                         className="copy-btn"
                         title="Copy password"
-                        onClick={() => { navigator.clipboard.writeText(e.Password); flash('Password copied') }}
+                        onClick={async () => {
+                          try { await copyText(e.Password); flash('Password copied') }
+                          catch { flash('Could not copy password') }
+                        }}
                       >
                         Copy
                       </button>
@@ -426,6 +524,8 @@ function VaultScreen({ onLock, onOpenWorkbench, workspaceEnabled }) {
           onClose={() => setTransferMode(null)}
         />
       )}
+
+      {userManagerOpen && <UserManagementModal onClose={() => setUserManagerOpen(false)} />}
 
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -658,6 +758,49 @@ function fmtShortDateTime(iso) {
   try { return new Date(iso).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) } catch { return iso }
 }
 
+function UserManagementModal({ onClose }) {
+  const [users, setUsers] = useState([])
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function loadUsers() {
+    try { setUsers((await ListUsers()) || []) } catch (err) { setError(String(err)) }
+  }
+  useEffect(() => { loadUsers() }, [])
+  async function addUser(event) {
+    event.preventDefault(); setError('')
+    if (!username.trim() || password.length < 12) { setError('Enter a username and an account password of at least 12 characters.'); return }
+    setBusy(true)
+    try { await CreateUser(username, password); setUsername(''); setPassword(''); await loadUsers() }
+    catch (err) { setError(String(err)) }
+    finally { setBusy(false) }
+  }
+  async function removeUser(user) {
+    if (!window.confirm(`Remove ${user.Username}'s account? They will lose access immediately.`)) return
+    setError('')
+    try { await RemoveUser(user.ID); await loadUsers() }
+    catch (err) { setError(String(err)) }
+  }
+  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="users-title">
+    <div className="modal users-modal">
+      <div className="modal-head"><h3 id="users-title">User access</h3><button className="icon-btn dark" onClick={onClose}>✕</button></div>
+      <div className="modal-body">
+        <div className="user-list">
+          {users.map(user => <div className="user-row" key={user.ID}><div><strong>{user.Username}</strong><span>{user.Role === 'superadmin' ? 'Super administrator' : 'Member'}</span></div>{user.Role !== 'superadmin' && <button className="copy-btn" onClick={() => removeUser(user)}>Remove</button>}</div>)}
+        </div>
+        <form className="add-user-form" onSubmit={addUser}>
+          <div className="form-divider">Add user</div>
+          <Field label="Username" value={username} onChange={event => setUsername(event.target.value)} disabled={busy} />
+          <Field label="Account password" type="password" value={password} onChange={event => setPassword(event.target.value)} disabled={busy} />
+          {error && <div className="err-box">{error}</div>}
+          <div className="modal-foot"><button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Close</button><button className="btn btn-primary" disabled={busy}>{busy ? 'Adding...' : 'Add user'}</button></div>
+        </form>
+      </div>
+    </div>
+  </div>
+}
+
 // ── Encrypted import / export ────────────────────────────────────────────────
 
 function TransferModal({ mode, onExport, onImport, onClose }) {
@@ -800,7 +943,7 @@ function DeleteConfirmationModal({ entries, onConfirm, onClose }) {
             ) : (
               <ClawCaptcha
                 title="Catch the specified toy to confirm deletion"
-                assetBase="/playcaptcha/toys/"
+                assetBase={withBasePath('playcaptcha/toys/')}
                 onVerify={() => { setCaptchaVerified(true); setError('') }}
               />
             )}
@@ -891,7 +1034,9 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
   }
 
   function copy(text, label) {
-    navigator.clipboard.writeText(text).then(() => flash(`${label} copied`))
+    copyText(text)
+      .then(() => flash(`${label} copied`))
+      .catch(() => flash(`Could not copy ${label.toLowerCase()}`))
   }
 
   return (

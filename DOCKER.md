@@ -15,7 +15,8 @@ docker compose up -d --build
 The two access points are deliberately separated:
 
 - On the Mac, open <http://localhost:8787> for Vault and Workspace.
-- On another device, open `http://MAC_LAN_IP:8788` for Vault only.
+- On the Mac, port `8788` is reserved for a gateway or reverse proxy that
+  exposes Vault-only access to other devices.
 
 The Vault-only server does not advertise Workspace in the UI, and its backend
 rejects every project-management API even if a client calls one manually.
@@ -61,8 +62,51 @@ macOS host. Workspace records and mounted project paths still work, but the
 Open menu is only able to launch applications when DevHub runs directly on the
 host operating system.
 
-## Network security
+## Public and mobile access
 
-Port 8788 uses plain HTTP unless you put DevHub behind an HTTPS reverse proxy.
-Vault passwords and decrypted entries must not be sent across an untrusted or
-public network. Use it only on a trusted private LAN until HTTPS is configured.
+The browser API now has account login, server-side sessions, and a separate
+vault-master-password unlock step. The initial setup creates the fixed super
+administrator account `admin`; it has **no default password**. Choose a unique
+admin account password and a separate vault master password (both at least 12
+characters). The `admin` account can add and remove member accounts from the
+Vault sidebar.
+
+DevHub itself does not terminate TLS and accepts HTTP from a gateway or reverse
+proxy. The Compose file keeps both application ports bound to loopback, so the
+application must not be published directly through a router.
+
+For local use after `docker compose up -d --build`, open
+<http://localhost:8787>. Compose explicitly permits HTTP only for these two
+host-loopback port mappings; do not change either `127.0.0.1:` port binding to
+`0.0.0.0`. If the container was already running, rebuild it for this local
+access exception to take effect.
+
+### Mounting below a gateway path
+
+The frontend base path is a build-time setting and defaults to `/`. To publish
+the app below `/vault/`, add this to `.env` before building:
+
+```dotenv
+DEVHUB_BASE_PATH=/vault/
+```
+
+Then rebuild with `docker compose up -d --build`. The browser will request
+`/vault/assets/...`, `/vault/api/...`, and `/vault/playcaptcha/...`; configure
+your gateway to remove `/vault` before proxying to the DevHub container. To
+return to root-path access, set `DEVHUB_BASE_PATH=/` or remove the variable and
+rebuild. The backend does not need to know the public prefix.
+
+Put a gateway or reverse proxy in front of `127.0.0.1:8788`. It may forward
+HTTP for a trusted LAN or VPN. For example, this Caddy configuration publishes
+only the Vault endpoint over HTTP:
+
+```caddy
+http://vault.example.com {
+    reverse_proxy 127.0.0.1:8788
+}
+```
+
+**Do not use this HTTP configuration on the public internet.** Account
+passwords, vault-master passwords, and decrypted entries can be read or changed
+by anyone able to intercept the connection. Use it only behind a VPN or a
+trusted private network. Do not expose the Docker application port itself.

@@ -5,17 +5,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VITE_BASE_PATH: ${DEVHUB_BASE_PATH:-/}
     image: local/devhub:latest
     container_name: devhub
     restart: unless-stopped
     init: true
     ports:
       - "127.0.0.1:${DEVHUB_PORT:-8787}:8787"
-      - "${DEVHUB_REMOTE_BIND:-0.0.0.0}:${DEVHUB_REMOTE_VAULT_PORT:-8788}:8788"
+      - "127.0.0.1:${DEVHUB_REMOTE_VAULT_PORT:-8788}:8788"
     environment:
       HOME: /data
       TZ: ${TZ:-Asia/Shanghai}
       DEVHUB_CONTAINER: "1"
+      DEVHUB_ALLOW_INSECURE_LOCAL: "1"
     volumes:
       - devhub-data:/data
       - type: bind

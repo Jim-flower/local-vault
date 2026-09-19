@@ -6,19 +6,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
-	ctx          context.Context
-	store        *Store
-	projectStore *ProjectStore
-	webMode      bool
+	ctx           context.Context
+	store         *Store
+	projectStore  *ProjectStore
+	webMode       bool
+	webSessions   *browserSessions
+	webSessionsMu sync.Mutex
 }
 
 func NewApp() *App { return &App{} }
+
+func (a *App) browserSessionStore() *browserSessions {
+	a.webSessionsMu.Lock()
+	defer a.webSessionsMu.Unlock()
+	if a.webSessions == nil {
+		a.webSessions = newBrowserSessions()
+	}
+	return a.webSessions
+}
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
