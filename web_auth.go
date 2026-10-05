@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,16 +16,28 @@ import (
 
 const webSessionCookie = "devhub_session"
 const webSessionLifetime = 12 * time.Hour
+const webSessionIdleTimeout = 30 * time.Minute
+const authFailureWindow = 10 * time.Minute
+const authBlockDuration = 15 * time.Minute
+const authFailureLimit = 5
 
 type browserSession struct {
 	User          User
 	VaultUnlocked bool
 	ExpiresAt     time.Time
+	LastSeenAt    time.Time
+}
+
+type authAttempt struct {
+	Failures     int
+	WindowStart  time.Time
+	BlockedUntil time.Time
 }
 
 type browserSessions struct {
 	mu       sync.Mutex
 	sessions map[string]browserSession
+	attempts map[string]authAttempt
 }
 
 type authStatus struct {
@@ -35,7 +49,7 @@ type authStatus struct {
 }
 
 func newBrowserSessions() *browserSessions {
-	return &browserSessions{sessions: make(map[string]browserSession)}
+	return &browserSessions{sessions: make(map[string]browserSession), attempts: make(map[string]authAttempt)}
 }
 
 func (s *browserSessions) create(user User) (string, error) {
@@ -45,7 +59,8 @@ func (s *browserSessions) create(user User) (string, error) {
 	}
 	token := hex.EncodeToString(bytes)
 	s.mu.Lock()
-	s.sessions[token] = browserSession{User: user, ExpiresAt: time.Now().Add(webSessionLifetime)}
+	now := time.Now()
+	s.sessions[token] = browserSession{User: user, ExpiresAt: now.Add(webSessionLifetime), LastSeenAt: now}
 	s.mu.Unlock()
 	return token, nil
 }
@@ -54,11 +69,60 @@ func (s *browserSessions) get(token string) (browserSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[token]
-	if !ok || time.Now().After(session.ExpiresAt) {
+	now := time.Now()
+	if !ok || now.After(session.ExpiresAt) || now.Sub(session.LastSeenAt) > webSessionIdleTimeout {
 		delete(s.sessions, token)
 		return browserSession{}, false
 	}
+	session.LastSeenAt = now
+	s.sessions[token] = session
 	return session, true
+}
+
+func (s *browserSessions) authBlocked(keys ...string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	var wait time.Duration
+	for _, key := range keys {
+		attempt, ok := s.attempts[key]
+		if !ok {
+			continue
+		}
+		if now.After(attempt.BlockedUntil) && now.Sub(attempt.WindowStart) > authFailureWindow {
+			delete(s.attempts, key)
+			continue
+		}
+		if remaining := time.Until(attempt.BlockedUntil); remaining > wait {
+			wait = remaining
+		}
+	}
+	return wait
+}
+
+func (s *browserSessions) recordAuthFailure(keys ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, key := range keys {
+		attempt := s.attempts[key]
+		if attempt.WindowStart.IsZero() || now.Sub(attempt.WindowStart) > authFailureWindow {
+			attempt = authAttempt{WindowStart: now}
+		}
+		attempt.Failures++
+		if attempt.Failures >= authFailureLimit {
+			attempt.BlockedUntil = now.Add(authBlockDuration)
+		}
+		s.attempts[key] = attempt
+	}
+}
+
+func (s *browserSessions) clearAuthFailures(keys ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range keys {
+		delete(s.attempts, key)
+	}
 }
 
 func (s *browserSessions) setVaultUnlocked(token string, unlocked bool) {
@@ -101,12 +165,103 @@ func isSecureWebRequest(request *http.Request) bool {
 	return request.TLS != nil || strings.EqualFold(request.Header.Get("X-Forwarded-Proto"), "https")
 }
 
-func remoteWebAccessAllowed(request *http.Request, allowRemote bool) bool {
+func remoteWebAccessAllowed(request *http.Request, allowRemote, workspaceEnabled bool) bool {
 	// Docker's port forwarding replaces a host-loopback client address with the
-	// bridge gateway address. Compose enables this exception only while both
-	// published ports are restricted to 127.0.0.1 on the host.
-	allowInsecureLocal := os.Getenv("DEVHUB_ALLOW_INSECURE_LOCAL") == "1"
-	return isLoopbackRequest(request) || allowInsecureLocal || allowRemote
+	// bridge gateway address. The Workspace listener accepts that exception only
+	// when the browser also used a loopback Host. A tunnel that accidentally
+	// targets port 8787 therefore cannot expose the maintenance interface.
+	if isLoopbackRequest(request) {
+		return true
+	}
+	if workspaceEnabled {
+		return os.Getenv("DEVHUB_ALLOW_INSECURE_LOCAL") == "1" && isLoopbackHost(request.Host)
+	}
+	if !allowRemote {
+		return false
+	}
+	return os.Getenv("DEVHUB_REQUIRE_HTTPS") == "0" || isSecureWebRequest(request)
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := strings.TrimSpace(hostport)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	return strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+}
+
+func clientAddress(request *http.Request) string {
+	// The last address is the value appended by the gateway directly in front
+	// of DevHub. Using the first value would let a client-supplied header evade
+	// the per-address authentication throttle.
+	if values := strings.Split(request.Header.Get("X-Forwarded-For"), ","); len(values) > 0 {
+		if forwarded := strings.TrimSpace(values[len(values)-1]); forwarded != "" {
+			return forwarded
+		}
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return request.RemoteAddr
+}
+
+func authAttemptKeys(request *http.Request, username string) []string {
+	return []string{"ip:" + clientAddress(request), "user:" + strings.ToLower(strings.TrimSpace(username))}
+}
+
+func rejectBlockedAuth(w http.ResponseWriter, sessions *browserSessions, keys ...string) bool {
+	wait := sessions.authBlocked(keys...)
+	if wait <= 0 {
+		return false
+	}
+	retryAfter := int(wait.Seconds()) + 1
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeWebJSON(w, http.StatusTooManyRequests, webResponse{Error: "too many failed attempts; try again later"})
+	return true
+}
+
+func validateBrowserOrigin(request *http.Request) bool {
+	if request.Method == http.MethodGet || request.Method == http.MethodHead || request.Method == http.MethodOptions {
+		return true
+	}
+	if site := strings.ToLower(strings.TrimSpace(request.Header.Get("Sec-Fetch-Site"))); site == "cross-site" {
+		return false
+	}
+	origin := strings.TrimSpace(request.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	requestHost := request.Host
+	scheme := "http"
+	if isSecureWebRequest(request) {
+		scheme = "https"
+	}
+	return strings.EqualFold(parsed.Scheme, scheme) && strings.EqualFold(parsed.Host, requestHost)
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		if isSecureWebRequest(r) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		if !validateBrowserOrigin(r) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "cross-origin request rejected"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func setSessionCookie(w http.ResponseWriter, request *http.Request, token string) {
@@ -152,8 +307,8 @@ func decodeWebBody(w http.ResponseWriter, request *http.Request, target any) boo
 }
 
 func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEnabled bool, w http.ResponseWriter, r *http.Request) {
-	if !remoteWebAccessAllowed(r, allowRemote) {
-		writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
+	if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
+		writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/auth")
@@ -167,7 +322,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
 		}
-		status := authStatus{Bootstrap: !hasUsers, Workspace: workspaceEnabled}
+		status := authStatus{Bootstrap: !hasUsers && workspaceEnabled, Workspace: workspaceEnabled}
 		if session, _, ok := requireBrowserSessionSilent(r, sessions); ok {
 			status.Authenticated = true
 			status.User = &session.User
@@ -183,6 +338,10 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 
 	switch path {
 	case "/bootstrap":
+		if !workspaceEnabled {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "initial administrator setup is available only on the local maintenance interface"})
+			return
+		}
 		var body struct{ Username, Password, MasterPassword string }
 		if !decodeWebBody(w, r, &body) {
 			return
@@ -232,11 +391,17 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 		if !decodeWebBody(w, r, &body) {
 			return
 		}
+		keys := authAttemptKeys(r, body.Username)
+		if rejectBlockedAuth(w, sessions, keys...) {
+			return
+		}
 		user, err := app.store.AuthenticateUser(body.Username, body.Password)
 		if err != nil {
+			sessions.recordAuthFailure(keys...)
 			writeWebJSON(w, http.StatusUnauthorized, webResponse{Error: "incorrect username or password"})
 			return
 		}
+		sessions.clearAuthFailures(keys...)
 		token, err := sessions.create(*user)
 		if err != nil {
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
@@ -262,10 +427,16 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 		if !decodeWebBody(w, r, &body) {
 			return
 		}
+		keys := authAttemptKeys(r, session.User.Username+":unlock")
+		if rejectBlockedAuth(w, sessions, keys...) {
+			return
+		}
 		if err := app.Unlock(body.MasterPassword); err != nil {
+			sessions.recordAuthFailure(keys...)
 			writeWebJSON(w, http.StatusUnauthorized, webResponse{Error: "incorrect master password"})
 			return
 		}
+		sessions.clearAuthFailures(keys...)
 		sessions.setVaultUnlocked(token, true)
 		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: &session.User, VaultUnlocked: true, Workspace: workspaceEnabled}})
 	case "/users":

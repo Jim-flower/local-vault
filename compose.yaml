@@ -19,6 +19,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       DEVHUB_CONTAINER: "1"
       DEVHUB_ALLOW_INSECURE_LOCAL: "1"
+      DEVHUB_REQUIRE_HTTPS: ${DEVHUB_REQUIRE_HTTPS:-1}
     volumes:
       - devhub-data:/data
       - type: bind

@@ -71,9 +71,15 @@ admin account password and a separate vault master password (both at least 12
 characters). The `admin` account can add and remove member accounts from the
 Vault sidebar.
 
-DevHub itself does not terminate TLS and accepts HTTP from a gateway or reverse
-proxy. The Compose file keeps both application ports bound to loopback, so the
-application must not be published directly through a router.
+Complete the first `admin` setup only at <http://localhost:8787>. The public
+Vault-only port deliberately refuses initial administrator creation, preventing
+an internet visitor from claiming an uninitialized deployment.
+
+DevHub does not hold TLS certificates itself. Your tunnel provider, gateway, or
+reverse proxy terminates HTTPS and forwards to `127.0.0.1:8788` over the local
+machine. The public browser connection is still encrypted end to end up to that
+trusted edge. Compose keeps both application ports bound to loopback, so the
+DevHub port must never be published directly through a router.
 
 For local use after `docker compose up -d --build`, open
 <http://localhost:8787>. Compose explicitly permits HTTP only for these two
@@ -96,17 +102,53 @@ your gateway to remove `/vault` before proxying to the DevHub container. To
 return to root-path access, set `DEVHUB_BASE_PATH=/` or remove the variable and
 rebuild. The backend does not need to know the public prefix.
 
-Put a gateway or reverse proxy in front of `127.0.0.1:8788`. It may forward
-HTTP for a trusted LAN or VPN. For example, this Caddy configuration publishes
-only the Vault endpoint over HTTP:
+For public access, keep this setting enabled (it is the default):
+
+```dotenv
+DEVHUB_REQUIRE_HTTPS=1
+```
+
+DevHub then rejects the public Vault listener unless the trusted gateway marks
+the original browser request as HTTPS. Plain HTTP between the gateway and
+`127.0.0.1:8788` is acceptable because it never leaves the host. The public URL
+must start with `https://`.
+
+Prefer a dedicated hostname such as `vault.example.com` instead of placing the
+password manager beside unrelated applications on the same web origin. This
+keeps its session cookie and browser trust boundary isolated. A `/vault/`
+prefix remains supported when a separate hostname is not available.
+
+For example, Caddy can terminate TLS and publish the Vault endpoint:
 
 ```caddy
-http://vault.example.com {
+vault.example.com {
     reverse_proxy 127.0.0.1:8788
 }
 ```
 
-**Do not use this HTTP configuration on the public internet.** Account
-passwords, vault-master passwords, and decrypted entries can be read or changed
-by anyone able to intercept the connection. Use it only behind a VPN or a
-trusted private network. Do not expose the Docker application port itself.
+Caddy supplies `X-Forwarded-Proto: https` automatically. With an existing
+gateway that strips the optional `/vault/` prefix, preserve the public host and
+set the original scheme explicitly. An Nginx location looks like this:
+
+```nginx
+location /vault/ {
+    proxy_pass http://127.0.0.1:8788/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+```
+
+If your inner-network tunnel already gives you an HTTPS public URL, point it at
+`http://127.0.0.1:8788` and ensure it overwrites `X-Forwarded-Proto` with
+`https`. If TLS ends at the tunnel provider and a local Nginx receives only the
+provider's HTTP hop, use `proxy_set_header X-Forwarded-Proto https;` there and
+make sure that Nginx listener is reachable only from the trusted tunnel. Never
+expose an `http://` public URL: account passwords, the vault master password,
+session cookies, and decrypted entries would otherwise be readable or modifiable
+in transit.
+
+Port `8787` remains the host-only maintenance interface and can be opened at
+`http://localhost:8787`. Port `8788` is Vault-only and intended for the HTTPS
+gateway or tunnel. Never configure a tunnel to target `8787`; the application
+also rejects non-loopback Host headers on that listener as a fail-safe.

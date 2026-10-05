@@ -55,6 +55,59 @@ func bootstrapWeb(t *testing.T, router http.Handler, remote bool) *http.Cookie {
 	return nil
 }
 
+func loginWeb(t *testing.T, router http.Handler, remote bool) *http.Cookie {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"account-password"}`))
+	if remote {
+		request.RemoteAddr = "192.0.2.10:12345"
+		request.Header.Set("X-Forwarded-Proto", "https")
+		request.Host = "vault.example.com"
+		request.Header.Set("Origin", "https://vault.example.com")
+	} else {
+		request.RemoteAddr = "127.0.0.1:12345"
+		request.Host = "localhost:8787"
+		request.Header.Set("Origin", "http://localhost:8787")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("login status = %d, body = %s", response.Code, response.Body.String())
+	}
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == webSessionCookie {
+			if remote && !cookie.Secure {
+				t.Fatal("remote login session cookie is not Secure")
+			}
+			return cookie
+		}
+	}
+	t.Fatal("login did not set a browser session cookie")
+	return nil
+}
+
+func unlockWeb(t *testing.T, router http.Handler, cookie *http.Cookie, remote bool) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/Unlock", bytes.NewBufferString(`{"args":["master-password"]}`))
+	if remote {
+		request.RemoteAddr = "192.0.2.10:12345"
+		request.Header.Set("X-Forwarded-Proto", "https")
+		request.Host = "vault.example.com"
+		request.Header.Set("Origin", "https://vault.example.com")
+	} else {
+		request.RemoteAddr = "127.0.0.1:12345"
+		request.Host = "localhost:8787"
+		request.Header.Set("Origin", "http://localhost:8787")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("unlock status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
 func TestWebRouterRequiresSignIn(t *testing.T) {
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
@@ -103,7 +156,7 @@ func TestWebRouterListsProjects(t *testing.T) {
 	}
 }
 
-func TestWebRouterReportsSecureRemoteCapabilitiesWithoutLeakingCredentials(t *testing.T) {
+func TestWorkspaceRouterRejectsSecureRemoteRequests(t *testing.T) {
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
@@ -115,21 +168,40 @@ func TestWebRouterReportsSecureRemoteCapabilitiesWithoutLeakingCredentials(t *te
 	request.Header.Set("X-Forwarded-Proto", "https")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusForbidden, response.Body.String())
+	}
+}
+
+func TestWorkspaceRouterAllowsDockerLoopbackForwardingOnlyWithLocalHost(t *testing.T) {
+	t.Setenv("DEVHUB_ALLOW_INSECURE_LOCAL", "1")
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := webRouter(app, "", webFS, true, true)
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+	request.RemoteAddr = "172.18.0.1:12345"
+	request.Host = "localhost:8787"
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	var payload struct {
-		Result authStatus `json:"result"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if !payload.Result.Bootstrap || !payload.Result.Workspace || payload.Result.Authenticated {
-		t.Fatalf("unexpected session: %#v", payload)
+
+	publicRequest := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+	publicRequest.RemoteAddr = "172.18.0.1:12345"
+	publicRequest.Host = "39.104.66.49:22283"
+	publicResponse := httptest.NewRecorder()
+	router.ServeHTTP(publicResponse, publicRequest)
+	if publicResponse.Code != http.StatusForbidden {
+		t.Fatalf("public status = %d, want %d", publicResponse.Code, http.StatusForbidden)
 	}
 }
 
 func TestWebRouterRejectsRemoteHTTPByDefault(t *testing.T) {
+	t.Setenv("DEVHUB_REQUIRE_HTTPS", "1")
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
@@ -145,6 +217,122 @@ func TestWebRouterRejectsRemoteHTTPByDefault(t *testing.T) {
 	}
 }
 
+func TestVaultOnlyRouterRejectsRemoteHTTPEvenWhenRemoteAccessEnabled(t *testing.T) {
+	t.Setenv("DEVHUB_REQUIRE_HTTPS", "1")
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := webRouter(app, "", webFS, true, false)
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+	request.RemoteAddr = "192.0.2.10:12345"
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusForbidden)
+	}
+}
+
+func TestVaultOnlyRouterRejectsInitialAdminSetup(t *testing.T) {
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := webRouter(app, "", webFS, true, false)
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/bootstrap", bytes.NewBufferString(`{"Username":"admin","Password":"account-password","MasterPassword":"master-password"}`))
+	request.RemoteAddr = "192.0.2.10:12345"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusForbidden, response.Body.String())
+	}
+}
+
+func TestSecureGatewayResponseSetsSecurityHeaders(t *testing.T) {
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := webRouter(app, "", webFS, true, false)
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "192.0.2.10:12345"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	for name, want := range map[string]string{
+		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+		"X-Content-Type-Options":    "nosniff",
+		"X-Frame-Options":           "DENY",
+		"Referrer-Policy":           "no-referrer",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if response.Header().Get("Content-Security-Policy") == "" {
+		t.Fatal("Content-Security-Policy header is missing")
+	}
+}
+
+func TestSecureGatewayRejectsCrossOriginMutation(t *testing.T) {
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := webRouter(app, "", webFS, true, false)
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"account-password"}`))
+	request.RemoteAddr = "192.0.2.10:12345"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("Origin", "https://attacker.example")
+	request.Host = "vault.example.com"
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusForbidden, response.Body.String())
+	}
+}
+
+func TestAuthenticationFailuresAreThrottled(t *testing.T) {
+	app := newWebTestApp(t)
+	webFS, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRouter := webRouter(app, "", webFS, false, true)
+	bootstrapWeb(t, localRouter, false)
+	router := webRouter(app, "", webFS, true, false)
+	for attempt := 1; attempt <= authFailureLimit; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"wrong-password"}`))
+		request.RemoteAddr = "192.0.2.10:12345"
+		request.Header.Set("X-Forwarded-Proto", "https")
+		request.Host = "vault.example.com"
+		request.Header.Set("Origin", "https://vault.example.com")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status = %d, want %d", attempt, response.Code, http.StatusUnauthorized)
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"account-password"}`))
+	request.RemoteAddr = "192.0.2.10:12345"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Host = "vault.example.com"
+	request.Header.Set("Origin", "https://vault.example.com")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("blocked status = %d, Retry-After = %q", response.Code, response.Header().Get("Retry-After"))
+	}
+}
+
 func TestVaultOnlyWebRouterHidesAndRejectsWorkspace(t *testing.T) {
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
@@ -152,6 +340,8 @@ func TestVaultOnlyWebRouterHidesAndRejectsWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := webRouter(app, "vault-token", webFS, true, false)
+	localRouter := webRouter(app, "", webFS, false, true)
+	bootstrapWeb(t, localRouter, false)
 
 	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	sessionRequest.RemoteAddr = "192.0.2.10:12345"
@@ -170,7 +360,7 @@ func TestVaultOnlyWebRouterHidesAndRejectsWorkspace(t *testing.T) {
 	if session.Result.Workspace {
 		t.Fatal("Vault-only session exposed Workspace capability")
 	}
-	cookie := bootstrapWeb(t, router, true)
+	cookie := loginWeb(t, router, true)
 
 	projectRequest := httptest.NewRequest(http.MethodPost, "/api/ListProjects", bytes.NewBufferString(`{"args":[]}`))
 	projectRequest.RemoteAddr = "192.0.2.10:12345"
@@ -200,7 +390,10 @@ func TestWebVaultExportImportRoundTrip(t *testing.T) {
 	}
 	source := newWebTestApp(t)
 	sourceRouter := webRouter(source, "source-token", webFS, true, false)
-	sourceCookie := bootstrapWeb(t, sourceRouter, true)
+	sourceLocalRouter := webRouter(source, "", webFS, false, true)
+	bootstrapWeb(t, sourceLocalRouter, false)
+	sourceCookie := loginWeb(t, sourceRouter, true)
+	unlockWeb(t, sourceRouter, sourceCookie, true)
 	categories, err := source.store.GetCategories()
 	if err != nil || len(categories) == 0 {
 		t.Fatalf("GetCategories: %v", err)
@@ -223,7 +416,10 @@ func TestWebVaultExportImportRoundTrip(t *testing.T) {
 
 	target := newWebTestApp(t)
 	targetRouter := webRouter(target, "target-token", webFS, true, false)
-	targetCookie := bootstrapWeb(t, targetRouter, true)
+	targetLocalRouter := webRouter(target, "", webFS, false, true)
+	bootstrapWeb(t, targetLocalRouter, false)
+	targetCookie := loginWeb(t, targetRouter, true)
+	unlockWeb(t, targetRouter, targetCookie, true)
 	var body bytes.Buffer
 	multipartWriter := multipart.NewWriter(&body)
 	if err := multipartWriter.WriteField("password", "archive-password"); err != nil {

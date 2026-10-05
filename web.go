@@ -48,7 +48,7 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 		return fmt.Errorf("load web assets: %w", err)
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
-	servers := []*http.Server{{Addr: address, Handler: webRouter(app, "", webFS, allowRemote, true)}}
+	servers := []*http.Server{newWebServer(address, webRouter(app, "", webFS, allowRemote, true))}
 	browserHost := host
 	if host == "0.0.0.0" || host == "::" {
 		browserHost = "127.0.0.1"
@@ -62,10 +62,7 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	}
 	if remoteVaultPort != 0 {
 		remoteAddress := net.JoinHostPort(host, strconv.Itoa(remoteVaultPort))
-		servers = append(servers, &http.Server{
-			Addr:    remoteAddress,
-			Handler: webRouter(app, "", webFS, allowRemote, false),
-		})
+		servers = append(servers, newWebServer(remoteAddress, webRouter(app, "", webFS, allowRemote, false)))
 		log.Printf("DevHub Vault-only access is listening on %s", remoteAddress)
 	}
 
@@ -83,6 +80,18 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	return err
 }
 
+func newWebServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bool) http.Handler {
 	sessions := app.browserSessionStore()
 	mux := http.NewServeMux()
@@ -93,8 +102,8 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		handleWebAuth(app, sessions, allowRemote, workspaceEnabled, w, r)
 	})
 	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
+		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -141,8 +150,8 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		_, _ = w.Write(data)
 	})
 	mux.HandleFunc("/api/import", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
+		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -192,8 +201,8 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		writeWebJSON(w, http.StatusOK, webResponse{Result: result})
 	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access is disabled"})
+		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -226,10 +235,20 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 				return
 			}
 			var masterPassword string
-			if err := json.Unmarshal(unlock.Args[0], &masterPassword); err != nil || app.Unlock(masterPassword) != nil {
+			if err := json.Unmarshal(unlock.Args[0], &masterPassword); err != nil {
+				writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "invalid unlock request"})
+				return
+			}
+			keys := authAttemptKeys(r, session.User.Username+":unlock")
+			if rejectBlockedAuth(w, sessions, keys...) {
+				return
+			}
+			if app.Unlock(masterPassword) != nil {
+				sessions.recordAuthFailure(keys...)
 				writeWebJSON(w, http.StatusUnauthorized, webResponse{Error: "incorrect master password"})
 				return
 			}
+			sessions.clearAuthFailures(keys...)
 			sessions.setVaultUnlocked(token, true)
 			writeWebJSON(w, http.StatusOK, webResponse{})
 			return
@@ -259,11 +278,9 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 
 	files := http.FileServer(http.FS(webFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		if isSecureWebRequest(r) {
-			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
+			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
+			return
 		}
 		if r.URL.Path != "/" {
 			if _, err := fs.Stat(webFS, strings.TrimPrefix(r.URL.Path, "/")); err == nil {
@@ -279,7 +296,7 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(index)
 	})
-	return mux
+	return securityHeaders(mux)
 }
 
 func isWorkspaceWebMethod(method string) bool {
