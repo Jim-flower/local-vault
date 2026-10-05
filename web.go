@@ -28,7 +28,7 @@ type webResponse struct {
 
 const maxVaultUploadSize = 16 << 20
 
-func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, allowRemote bool) error {
+func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, allowRemote bool, basePath string) error {
 	if port < 1024 || port > 65535 {
 		return fmt.Errorf("port must be between 1024 and 65535")
 	}
@@ -39,22 +39,28 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	if host == "" {
 		return fmt.Errorf("host is required")
 	}
-	app.webMode = true
+	basePath, err := normalizeBasePath(basePath)
+	if err != nil {
+		return err
+	}
 	app.startup(webStartupContext())
 	defer app.shutdown(webStartupContext())
+	if app.store == nil {
+		return fmt.Errorf("open Vault database: store unavailable")
+	}
 
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		return fmt.Errorf("load web assets: %w", err)
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
-	servers := []*http.Server{newWebServer(address, webRouter(app, "", webFS, allowRemote, true))}
+	servers := []*http.Server{newWebServer(address, webRouter(app, webFS, webOptions{BasePath: "/", LocalOnly: true}))}
 	browserHost := host
 	if host == "0.0.0.0" || host == "::" {
 		browserHost = "127.0.0.1"
 	}
 	url := "http://" + net.JoinHostPort(browserHost, strconv.Itoa(port)) + "/"
-	log.Printf("DevHub Web is running locally at %s", url)
+	log.Printf("Vault maintenance is running locally at %s", url)
 	if openBrowser {
 		if err := openDefaultBrowser(url); err != nil {
 			log.Printf("Could not open the browser automatically: %v", err)
@@ -62,8 +68,8 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	}
 	if remoteVaultPort != 0 {
 		remoteAddress := net.JoinHostPort(host, strconv.Itoa(remoteVaultPort))
-		servers = append(servers, newWebServer(remoteAddress, webRouter(app, "", webFS, allowRemote, false)))
-		log.Printf("DevHub Vault-only access is listening on %s", remoteAddress)
+		servers = append(servers, newWebServer(remoteAddress, webRouter(app, webFS, webOptions{BasePath: basePath, AllowRemote: allowRemote})))
+		log.Printf("Vault access is listening on http://%s%s", remoteAddress, basePath)
 	}
 
 	errorsByServer := make(chan error, len(servers))
@@ -92,20 +98,21 @@ func newWebServer(address string, handler http.Handler) *http.Server {
 	}
 }
 
-func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bool) http.Handler {
+func webRouter(app *App, webFS fs.FS, options webOptions) http.Handler {
+	basePath, err := normalizeBasePath(options.BasePath)
+	if err != nil {
+		panic(err)
+	}
+	options.BasePath = basePath
 	sessions := app.browserSessionStore()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth", func(w http.ResponseWriter, r *http.Request) {
-		handleWebAuth(app, sessions, allowRemote, workspaceEnabled, w, r)
+		handleWebAuth(app, sessions, options.LocalOnly, w, r)
 	})
 	mux.HandleFunc("/api/auth/", func(w http.ResponseWriter, r *http.Request) {
-		handleWebAuth(app, sessions, allowRemote, workspaceEnabled, w, r)
+		handleWebAuth(app, sessions, options.LocalOnly, w, r)
 	})
 	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -150,10 +157,6 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		_, _ = w.Write(data)
 	})
 	mux.HandleFunc("/api/import", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -201,10 +204,6 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		writeWebJSON(w, http.StatusOK, webResponse{Result: result})
 	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -212,10 +211,6 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 		method := strings.TrimPrefix(r.URL.Path, "/api/")
 		session, token, ok := requireBrowserSession(w, r, sessions)
 		if !ok {
-			return
-		}
-		if !workspaceEnabled && isWorkspaceWebMethod(method) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "Workspace is available only on the host computer"})
 			return
 		}
 		if method == "IsUnlocked" {
@@ -257,7 +252,7 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "complete the administrator setup first"})
 			return
 		}
-		if method != "IsInitialized" && !isWorkspaceWebMethod(method) {
+		if method != "IsInitialized" {
 			if !session.VaultUnlocked || !app.IsUnlocked() {
 				writeWebJSON(w, http.StatusLocked, webResponse{Error: "unlock the vault to continue"})
 				return
@@ -278,13 +273,14 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 
 	files := http.FileServer(http.FS(webFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
-			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
-			return
-		}
-		if r.URL.Path != "/" {
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			if _, err := fs.Stat(webFS, strings.TrimPrefix(r.URL.Path, "/")); err == nil {
 				files.ServeHTTP(w, r)
+				return
+			}
+			// Missing files must not masquerade as successful HTML responses.
+			if strings.HasPrefix(r.URL.Path, "/assets/") || strings.HasPrefix(r.URL.Path, "/playcaptcha/") || strings.HasSuffix(r.URL.Path, ".svg") {
+				http.NotFound(w, r)
 				return
 			}
 		}
@@ -294,18 +290,10 @@ func webRouter(app *App, _ string, webFS fs.FS, allowRemote, workspaceEnabled bo
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(index)
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(strings.Replace(string(index), "<head>", `<head><base href="`+options.BasePath+`">`, 1)))
 	})
-	return securityHeaders(mux)
-}
-
-func isWorkspaceWebMethod(method string) bool {
-	switch method {
-	case "ListProjects", "ChooseProjectDirectory", "AddProject", "UpdateProject", "DeleteProject", "OpenProject", "OpenProjectWith":
-		return true
-	default:
-		return false
-	}
+	return mountWebRouter(securityHeaders(mux), options)
 }
 
 func callWebAPI(app *App, method string, args []json.RawMessage) (any, error) {
@@ -330,10 +318,6 @@ func callWebAPI(app *App, method string, args []json.RawMessage) (any, error) {
 		return nil, nil
 	case "GetCategories":
 		return app.GetCategories()
-	case "ListProjects":
-		return app.ListProjects()
-	case "ChooseProjectDirectory":
-		return app.ChooseProjectDirectory()
 	case "Initialize":
 		return nil, decodeCall(args, &text, func() error { return app.Initialize(text) })
 	case "Unlock":
@@ -362,20 +346,6 @@ func callWebAPI(app *App, method string, args []json.RawMessage) (any, error) {
 		return nil, decodeCall(args, &text, &id, &textTwo, &textThree, &textFour, &textFive, &textSix, &textSeven, func() error {
 			return app.UpdateEntry(text, id, textTwo, textThree, textFour, textFive, textSix, textSeven)
 		})
-	case "ExportVault":
-		return callOneString(args, app.ExportVault)
-	case "ImportVault":
-		return callOneString(args, app.ImportVault)
-	case "AddProject":
-		return callFourStrings(args, app.AddProject)
-	case "UpdateProject":
-		return nil, decodeCall(args, &id, &text, &textTwo, &textThree, &textFour, func() error { return app.UpdateProject(id, text, textTwo, textThree, textFour) })
-	case "DeleteProject":
-		return nil, decodeCall(args, &id, func() error { return app.DeleteProject(id) })
-	case "OpenProject":
-		return nil, decodeCall(args, &id, func() error { return app.OpenProject(id) })
-	case "OpenProjectWith":
-		return nil, decodeCall(args, &id, &text, func() error { return app.OpenProjectWith(id, text) })
 	default:
 		return nil, fmt.Errorf("unknown API method")
 	}
@@ -422,15 +392,6 @@ func callOneInt64[T any](args []json.RawMessage, function func(int64) (T, error)
 	}
 	return function(value)
 }
-func callFourStrings[T any](args []json.RawMessage, function func(string, string, string, string) (T, error)) (T, error) {
-	var one, two, three, four string
-	if err := decodeCall(args, &one, &two, &three, &four, func() error { return nil }); err != nil {
-		var empty T
-		return empty, err
-	}
-	return function(one, two, three, four)
-}
-
 func writeWebJSON(w http.ResponseWriter, status int, response webResponse) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

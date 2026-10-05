@@ -7,8 +7,6 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY frontend/ ./
-ARG VITE_BASE_PATH=/
-ENV VITE_BASE_PATH=${VITE_BASE_PATH}
 RUN npm run build
 
 FROM golang:1.25-alpine AS go-build
@@ -27,8 +25,8 @@ FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S -g 10001 devhub \
     && adduser -S -D -H -u 10001 -G devhub devhub \
-    && mkdir -p /data /projects \
-    && chown -R devhub:devhub /data /projects
+    && mkdir -p /data \
+    && chown -R devhub:devhub /data
 
 COPY --from=go-build /out/devhub /usr/local/bin/devhub
 
@@ -37,7 +35,7 @@ WORKDIR /data
 ENV HOME=/data
 
 EXPOSE 8787 8788
-VOLUME ["/data", "/projects"]
+VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/local/bin/devhub"]
 CMD ["-web", "-host", "0.0.0.0", "-port", "8787", "-remote-vault-port", "8788", "-no-open", "-allow-remote"]

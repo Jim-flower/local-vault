@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,7 +44,6 @@ type authStatus struct {
 	Authenticated bool  `json:"authenticated"`
 	User          *User `json:"user,omitempty"`
 	VaultUnlocked bool  `json:"vaultUnlocked"`
-	Workspace     bool  `json:"workspace"`
 }
 
 func newBrowserSessions() *browserSessions {
@@ -165,23 +163,6 @@ func isSecureWebRequest(request *http.Request) bool {
 	return request.TLS != nil || strings.EqualFold(request.Header.Get("X-Forwarded-Proto"), "https")
 }
 
-func remoteWebAccessAllowed(request *http.Request, allowRemote, workspaceEnabled bool) bool {
-	// Docker's port forwarding replaces a host-loopback client address with the
-	// bridge gateway address. The Workspace listener accepts that exception only
-	// when the browser also used a loopback Host. A tunnel that accidentally
-	// targets port 8787 therefore cannot expose the maintenance interface.
-	if isLoopbackRequest(request) {
-		return true
-	}
-	if workspaceEnabled {
-		return os.Getenv("DEVHUB_ALLOW_INSECURE_LOCAL") == "1" && isLoopbackHost(request.Host)
-	}
-	if !allowRemote {
-		return false
-	}
-	return os.Getenv("DEVHUB_REQUIRE_HTTPS") == "0" || isSecureWebRequest(request)
-}
-
 func isLoopbackHost(hostport string) bool {
 	host := strings.TrimSpace(hostport)
 	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
@@ -268,7 +249,7 @@ func setSessionCookie(w http.ResponseWriter, request *http.Request, token string
 	http.SetCookie(w, &http.Cookie{
 		Name:     webSessionCookie,
 		Value:    token,
-		Path:     "/",
+		Path:     requestBasePath(request),
 		MaxAge:   int(webSessionLifetime.Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
@@ -277,7 +258,7 @@ func setSessionCookie(w http.ResponseWriter, request *http.Request, token string
 }
 
 func clearSessionCookie(w http.ResponseWriter, request *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: webSessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: isSecureWebRequest(request)})
+	http.SetCookie(w, &http.Cookie{Name: webSessionCookie, Value: "", Path: requestBasePath(request), MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: isSecureWebRequest(request)})
 }
 
 func sessionToken(request *http.Request) string {
@@ -306,11 +287,7 @@ func decodeWebBody(w http.ResponseWriter, request *http.Request, target any) boo
 	return true
 }
 
-func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEnabled bool, w http.ResponseWriter, r *http.Request) {
-	if !remoteWebAccessAllowed(r, allowRemote, workspaceEnabled) {
-		writeWebJSON(w, http.StatusForbidden, webResponse{Error: "remote access requires HTTPS"})
-		return
-	}
+func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/auth")
 	if path == "" || path == "/status" {
 		if r.Method != http.MethodGet {
@@ -322,7 +299,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
 		}
-		status := authStatus{Bootstrap: !hasUsers && workspaceEnabled, Workspace: workspaceEnabled}
+		status := authStatus{Bootstrap: !hasUsers && localOnly}
 		if session, _, ok := requireBrowserSessionSilent(r, sessions); ok {
 			status.Authenticated = true
 			status.User = &session.User
@@ -338,7 +315,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 
 	switch path {
 	case "/bootstrap":
-		if !workspaceEnabled {
+		if !localOnly {
 			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "initial administrator setup is available only on the local maintenance interface"})
 			return
 		}
@@ -385,7 +362,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 		}
 		sessions.setVaultUnlocked(token, true)
 		setSessionCookie(w, r, token)
-		writeWebJSON(w, http.StatusCreated, webResponse{Result: authStatus{Authenticated: true, User: user, VaultUnlocked: true, Workspace: workspaceEnabled}})
+		writeWebJSON(w, http.StatusCreated, webResponse{Result: authStatus{Authenticated: true, User: user, VaultUnlocked: true}})
 	case "/login":
 		var body struct{ Username, Password string }
 		if !decodeWebBody(w, r, &body) {
@@ -408,7 +385,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 			return
 		}
 		setSessionCookie(w, r, token)
-		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: user, Workspace: workspaceEnabled}})
+		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: user}})
 	case "/logout":
 		_, token, ok := requireBrowserSession(w, r, sessions)
 		if !ok {
@@ -438,7 +415,7 @@ func handleWebAuth(app *App, sessions *browserSessions, allowRemote, workspaceEn
 		}
 		sessions.clearAuthFailures(keys...)
 		sessions.setVaultUnlocked(token, true)
-		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: &session.User, VaultUnlocked: true, Workspace: workspaceEnabled}})
+		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: &session.User, VaultUnlocked: true}})
 	case "/users":
 		session, _, ok := requireSuperAdmin(w, r, sessions)
 		if !ok {

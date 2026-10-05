@@ -15,8 +15,6 @@ import (
 type App struct {
 	ctx           context.Context
 	store         *Store
-	projectStore  *ProjectStore
-	webMode       bool
 	webSessions   *browserSessions
 	webSessionsMu sync.Mutex
 }
@@ -38,12 +36,6 @@ func (a *App) startup(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	projects, err := OpenProjectStore(filepath.Join(home, ".devhub.db"))
-	if err != nil {
-		return
-	}
-	a.projectStore = projects
-
 	s, err := OpenStore(filepath.Join(home, ".vault.db"))
 	if err != nil {
 		return
@@ -54,9 +46,6 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(ctx context.Context) {
 	if a.store != nil {
 		_ = a.store.Close()
-	}
-	if a.projectStore != nil {
-		_ = a.projectStore.Close()
 	}
 }
 
@@ -202,20 +191,14 @@ func (a *App) ExportVault(exportPassword string) (*ExportResult, error) {
 		return nil, fmt.Errorf("store not available")
 	}
 	filename := "vault-export-" + time.Now().Format("20060102") + ".zip"
-	var path string
-	var err error
-	if a.webMode {
-		path, err = chooseSaveFileForWeb(filename)
-	} else {
-		path, err = runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-			Title:           "导出加密密码库",
-			DefaultFilename: filename,
-			Filters: []runtime.FileFilter{{
-				DisplayName: "加密 ZIP 文件 (*.zip)",
-				Pattern:     "*.zip",
-			}},
-		})
-	}
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "导出加密密码库",
+		DefaultFilename: filename,
+		Filters: []runtime.FileFilter{{
+			DisplayName: "加密 ZIP 文件 (*.zip)",
+			Pattern:     "*.zip",
+		}},
+	})
 	if err != nil || path == "" {
 		return nil, err
 	}
@@ -235,19 +218,13 @@ func (a *App) ImportVault(zipPassword string) (*ImportResult, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not available")
 	}
-	var path string
-	var err error
-	if a.webMode {
-		path, err = chooseOpenFileForWeb()
-	} else {
-		path, err = runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-			Title: "选择要导入的 Vault ZIP 文件",
-			Filters: []runtime.FileFilter{{
-				DisplayName: "加密 ZIP 文件 (*.zip)",
-				Pattern:     "*.zip",
-			}},
-		})
-	}
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择要导入的 Vault ZIP 文件",
+		Filters: []runtime.FileFilter{{
+			DisplayName: "加密 ZIP 文件 (*.zip)",
+			Pattern:     "*.zip",
+		}},
+	})
 	if err != nil || path == "" {
 		return nil, err
 	}
@@ -256,58 +233,4 @@ func (a *App) ImportVault(zipPassword string) (*ImportResult, error) {
 
 func (a *App) GeneratePassword(length int) (string, error) {
 	return generatePassword(length)
-}
-
-// ── Project workbench ─────────────────────────────────────────────────────
-
-func (a *App) ListProjects() ([]*Project, error) {
-	if a.projectStore == nil {
-		return nil, fmt.Errorf("project workbench is not available")
-	}
-	return a.projectStore.List()
-}
-
-func (a *App) AddProject(name, path, description, tags string) (int64, error) {
-	if a.projectStore == nil {
-		return 0, fmt.Errorf("project workbench is not available")
-	}
-	return a.projectStore.Add(name, path, description, tags)
-}
-
-func (a *App) UpdateProject(id int64, name, path, description, tags string) error {
-	if a.projectStore == nil {
-		return fmt.Errorf("project workbench is not available")
-	}
-	return a.projectStore.Update(id, name, path, description, tags)
-}
-
-func (a *App) DeleteProject(id int64) error {
-	if a.projectStore == nil {
-		return fmt.Errorf("project workbench is not available")
-	}
-	return a.projectStore.Delete(id)
-}
-
-func (a *App) ChooseProjectDirectory() (string, error) {
-	if a.webMode {
-		return chooseDirectoryForWeb()
-	}
-	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "选择项目文件夹"})
-}
-
-func (a *App) OpenProject(id int64) error {
-	if a.projectStore == nil {
-		return fmt.Errorf("project workbench is not available")
-	}
-	return a.projectStore.Open(id)
-}
-
-func (a *App) OpenProjectWith(id int64, target string) error {
-	if a.projectStore == nil {
-		return fmt.Errorf("project workbench is not available")
-	}
-	if a.webMode && os.Getenv("DEVHUB_CONTAINER") == "1" {
-		return fmt.Errorf("host applications cannot be opened from the container; run DevHub directly on macOS to use Open with")
-	}
-	return a.projectStore.OpenWith(id, target)
 }

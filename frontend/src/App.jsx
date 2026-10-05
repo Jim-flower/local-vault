@@ -3,12 +3,11 @@ import { ClawCaptcha } from 'playcaptcha'
 import 'playcaptcha/clawcaptcha.css'
 import {
   IsInitialized, IsUnlocked, Initialize, Unlock, Lock,
-  GetWebCapabilities, GetAuthStatus, BootstrapAdmin, Login, Logout, IsWebApp,
+  GetAuthStatus, BootstrapAdmin, Login, Logout,
   withBasePath,
   GetCategories, AddCategory, DeleteCategory,
   ListEntries, SearchEntries, AddEntry, UpdateEntry, DeleteEntries,
   GeneratePassword, GetTOTPCode, GetEntryHistory, ExportVault, ImportVault,
-  ListProjects, AddProject, UpdateProject, DeleteProject, ChooseProjectDirectory, OpenProjectWith,
   ListUsers, CreateUser, RemoveUser,
 } from './bridge'
 
@@ -34,26 +33,19 @@ async function copyText(text) {
 
 export default function App() {
   const [screen, setScreen] = useState('loading')
-  const [workspaceEnabled, setWorkspaceEnabled] = useState(true)
   const [currentUser, setCurrentUser] = useState(null)
-  const webApp = IsWebApp()
 
   useEffect(() => {
     GetAuthStatus()
       .then(async status => {
         if (status) {
-          setWorkspaceEnabled(status.workspace !== false)
           setCurrentUser(status.user || null)
           if (status.bootstrap) { setScreen('admin-setup'); return }
           if (!status.authenticated) { setScreen('login'); return }
           setScreen(status.vaultUnlocked ? 'vault' : 'locked')
           return
         }
-        const capabilities = await GetWebCapabilities()
-        const enabled = capabilities.workspace !== false
-        setWorkspaceEnabled(enabled)
-        if (enabled) setScreen('workbench')
-        else await openVault()
+        await openVault()
       })
       .catch(() => setScreen('locked'))
   }, [])
@@ -69,10 +61,10 @@ export default function App() {
   if (screen === 'loading') return <Splash />
   if (screen === 'admin-setup') return <AdminSetupScreen onDone={user => { setCurrentUser(user); setScreen('vault') }} />
   if (screen === 'login') return <LoginScreen onDone={user => { setCurrentUser(user); setScreen('locked') }} />
-  if (screen === 'setup')   return <LockScreen mode="setup"  onDone={() => setScreen('vault')} onCancel={() => setScreen('workbench')} canGoBack={workspaceEnabled} />
-  if (screen === 'locked')  return <LockScreen mode="unlock" onDone={() => setScreen('vault')} onCancel={() => setScreen('workbench')} canGoBack={workspaceEnabled} />
-  if (screen === 'vault')   return <VaultScreen user={currentUser} onLogout={async () => { await Logout(); setCurrentUser(null); setScreen('login') }} onLock={() => setScreen(webApp ? 'locked' : workspaceEnabled ? 'workbench' : 'locked')} onOpenWorkbench={() => setScreen('workbench')} workspaceEnabled={workspaceEnabled} />
-  return <ProjectWorkbench onOpenVault={openVault} />
+  if (screen === 'setup')   return <LockScreen mode="setup"  onDone={() => setScreen('vault')} />
+  if (screen === 'locked')  return <LockScreen mode="unlock" onDone={() => setScreen('vault')} />
+  if (screen === 'vault')   return <VaultScreen user={currentUser} onLogout={async () => { await Logout(); setCurrentUser(null); setScreen('login') }} onLock={() => setScreen('locked')} />
+  return <Splash />
 }
 
 // ── Splash ────────────────────────────────────────────────────────────────────
@@ -145,7 +137,7 @@ function AdminSetupScreen({ onDone }) {
 
 // ── LockScreen ────────────────────────────────────────────────────────────────
 
-function LockScreen({ mode, onDone, onCancel, canGoBack }) {
+function LockScreen({ mode, onDone }) {
   const [pw, setPw]           = useState('')
   const [confirm, setConfirm] = useState('')
   const [error, setError]     = useState('')
@@ -188,11 +180,6 @@ function LockScreen({ mode, onDone, onCancel, canGoBack }) {
           <button className="btn btn-primary w-full" disabled={busy}>
             {busy ? 'Please wait…' : mode === 'setup' ? 'Create Vault' : 'Unlock'}
           </button>
-          {canGoBack && (
-            <button type="button" className="btn btn-ghost w-full lock-back" onClick={onCancel} disabled={busy}>
-              Back to Workspace
-            </button>
-          )}
         </form>
       </div>
     </div>
@@ -201,7 +188,7 @@ function LockScreen({ mode, onDone, onCancel, canGoBack }) {
 
 // ── VaultScreen ───────────────────────────────────────────────────────────────
 
-function VaultScreen({ user, onLogout, onLock, onOpenWorkbench, workspaceEnabled }) {
+function VaultScreen({ user, onLogout, onLock }) {
   const [categories, setCategories] = useState([])
   const [activeCat,  setActiveCat]  = useState(0)     // 0 = All
   const [entries,    setEntries]    = useState([])
@@ -334,11 +321,6 @@ function VaultScreen({ user, onLogout, onLock, onOpenWorkbench, workspaceEnabled
             {user?.Role === 'superadmin' && <button className="icon-btn" title="Manage users" onClick={() => setUserManagerOpen(true)}>⚙</button>}
             <button className="icon-btn" title="Lock vault" onClick={async () => { await Lock(); onLock() }}>⏏</button>
           </div>
-        </div>
-
-        <div className="module-nav">
-          {workspaceEnabled && <button className="module-nav-item" onClick={onOpenWorkbench}>▦ Workspace</button>}
-          <button className="module-nav-item active">🔐 Vault</button>
         </div>
 
         <div className="sb-label">CATEGORIES</div>
@@ -530,232 +512,6 @@ function VaultScreen({ user, onLogout, onLock, onOpenWorkbench, workspaceEnabled
       {toast && <div className="toast">{toast}</div>}
     </div>
   )
-}
-
-// ── Project workbench ───────────────────────────────────────────────────────
-
-function ProjectWorkbench({ onOpenVault }) {
-  const [projects, setProjects] = useState([])
-  const [search, setSearch] = useState('')
-  const [modal, setModal] = useState(null)
-  const [toast, setToast] = useState('')
-  const [openProjectMenu, setOpenProjectMenu] = useState(null)
-
-  useEffect(() => { loadProjects() }, [])
-  async function loadProjects() {
-    try { setProjects((await ListProjects()) || []) }
-    catch (err) { flash(`Could not load projects: ${String(err)}`) }
-  }
-  function flash(message) { setToast(message); setTimeout(() => setToast(''), 2600) }
-  async function saveProject(form, id) {
-    if (id) await UpdateProject(id, form.name, form.path, form.description, form.tags)
-    else await AddProject(form.name, form.path, form.description, form.tags)
-    flash(id ? 'Project updated' : 'Project added to Workspace')
-    setModal(null); loadProjects()
-  }
-  async function openProject(project, target) {
-    try {
-      await OpenProjectWith(project.ID, target)
-      setOpenProjectMenu(null); flash(`Opening ${project.Name} in ${OPEN_TARGET_NAMES[target]}`); loadProjects()
-    } catch (err) { flash(String(err)) }
-  }
-  async function removeProject(project) {
-    if (!window.confirm(`Remove “${project.Name}” from Workspace? This will not delete any files from disk.`)) return
-    try {
-      await DeleteProject(project.ID)
-      setOpenProjectMenu(null)
-      flash('Project removed from Workspace')
-      loadProjects()
-    }
-    catch (err) { flash(String(err)) }
-  }
-
-  const query = search.trim().toLowerCase()
-  const visibleProjects = query ? projects.filter(project => [project.Name, project.Path, project.Description, project.Tags].join(' ').toLowerCase().includes(query)) : projects
-
-  return (
-    <div className="layout">
-      <aside className="sidebar">
-        <div className="sb-top"><span className="brand">◈ DevHub</span></div>
-        <div className="module-nav">
-          <button className="module-nav-item active">▦ Workspace</button>
-          <button className="module-nav-item" onClick={onOpenVault}>🔐 Vault</button>
-        </div>
-        <div className="sb-label">WORKSPACE</div>
-        <nav className="cat-list">
-          <button className="cat-item active" onClick={() => setSearch('')}>
-            <span className="cat-dot all-dot" />
-            <span className="cat-name">All Projects</span>
-            <span className="cat-badge">{projects.length}</span>
-          </button>
-        </nav>
-        <div className="sb-footer"><button className="new-cat-btn" onClick={() => setModal({ mode: 'add' })}>＋ Add Project</button></div>
-      </aside>
-
-      <div className="main-panel">
-        <div className="panel-bar">
-          <h2 className="panel-title">Workspace</h2>
-          <input className="panel-search" value={search} onChange={event => setSearch(event.target.value)} placeholder="Search projects…" />
-          <button className="btn btn-primary" onClick={() => setModal({ mode: 'add' })}>+ Add Project</button>
-        </div>
-        {visibleProjects.length === 0 ? (
-          <div className="empty-state">{search ? `No results for "${search}"` : 'No projects here yet. Click "+ Add Project" to get started.'}</div>
-        ) : (
-          <div className="table-wrap">
-            <table className="entry-table workspace-table">
-              <thead><tr><th>Project</th><th>Folder</th><th>Tags</th><th>Last Opened</th><th /></tr></thead>
-              <tbody>
-                {visibleProjects.map(project => (
-                  <tr key={project.ID} className="entry-row" onClick={() => setModal({ mode: 'edit', project })}>
-                    <td><div className="name-cell"><div className="avatar workspace-project-avatar" style={{ background: projectColor(project.Name) }}>{project.Name[0]?.toUpperCase() || 'P'}</div><span className="entry-name-text">{project.Name}</span></div></td>
-                    <td className="cell-muted cell-url" title={project.Path}>{project.Path}</td>
-                    <td>{project.Tags ? <span className="cat-pill">{project.Tags}</span> : <span className="cell-muted">—</span>}</td>
-                    <td className="cell-muted">{project.LastOpenedAt ? fmtShortDateTime(project.LastOpenedAt) : 'Never'}</td>
-                    <td className="cell-action" onClick={event => event.stopPropagation()}>
-                      <div className="project-open-menu">
-                        <button className="copy-btn" onClick={() => setOpenProjectMenu(project)}>Open ▾</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-      {modal && <ProjectModal mode={modal.mode} project={modal.project} onSave={saveProject} onClose={() => setModal(null)} />}
-      {openProjectMenu && <OpenProjectModal project={openProjectMenu} onOpen={openProject} onRemove={removeProject} onClose={() => setOpenProjectMenu(null)} />}
-      {toast && <div className="toast">{toast}</div>}
-    </div>
-  )
-}
-
-function OpenProjectModal({ project, onOpen, onRemove, onClose }) {
-  const [selectingTerminal, setSelectingTerminal] = useState(false)
-  const targets = [
-    ['explorer', 'File Explorer', 'Open the project folder in Explorer'],
-    ['vscode', 'VS Code', 'Open this folder as a VS Code workspace'],
-    ['sublime', 'Sublime Text', 'Open this folder in Sublime Text'],
-  ]
-  const terminals = [
-    ['terminal-wt', 'Windows Terminal', 'Open the default Windows Terminal profile'],
-    ['terminal-pwsh', 'PowerShell 7', 'Open PowerShell 7 directly in this folder'],
-    ['terminal-cmd', 'Command Prompt', 'Open cmd.exe directly in this folder'],
-  ]
-  const choices = selectingTerminal ? terminals : targets
-  const title = selectingTerminal ? 'Choose terminal' : 'Open project'
-  const prompt = selectingTerminal ? 'Choose the terminal to start in this project folder.' : 'Choose how you want to open this local project.'
-  return (
-    <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="open-project-title" onMouseDown={onClose}>
-      <div className="modal open-project-modal" onMouseDown={event => event.stopPropagation()}>
-        <div className="modal-head">
-          <div>
-            <h3 id="open-project-title">{title}</h3>
-            <p className="open-project-name">{project.Name}</p>
-          </div>
-          <div className="open-project-head-actions">
-            {selectingTerminal && <button className="btn btn-ghost btn-sm" onClick={() => setSelectingTerminal(false)}>← Back</button>}
-            <button className="icon-btn dark" onClick={onClose}>✕</button>
-          </div>
-        </div>
-        <div className="modal-body open-project-body">
-          <p className="open-project-prompt">{prompt}</p>
-          <div className="open-target-list">
-            {choices.map(([target, label, description]) => (
-              <button key={target} className="open-target" onClick={() => onOpen(project, target)}>
-                <span className="open-target-icon">{OPEN_TARGET_ICONS[target]}</span>
-                <span><strong>{label}</strong><small>{description}</small></span>
-                <span className="open-target-arrow">›</span>
-              </button>
-            ))}
-            {!selectingTerminal && (
-              <button className="open-target" onClick={() => setSelectingTerminal(true)}>
-                <span className="open-target-icon">{OPEN_TARGET_ICONS.terminal}</span>
-                <span><strong>Terminal</strong><small>Choose which terminal to start in this folder</small></span>
-                <span className="open-target-arrow">›</span>
-              </button>
-            )}
-          </div>
-          {!selectingTerminal && <button className="open-project-remove" onClick={() => onRemove(project)}>Remove project from Workspace</button>}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function ProjectModal({ mode, project, onSave, onClose }) {
-  const [form, setForm] = useState({
-    name: project?.Name || '', path: project?.Path || '', description: project?.Description || '', tags: project?.Tags || '',
-  })
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  const isEdit = mode === 'edit'
-
-  function set(field) { return event => setForm(current => ({ ...current, [field]: event.target.value })) }
-  async function chooseDirectory() {
-    try {
-      const path = await ChooseProjectDirectory()
-      if (!path) return
-      setForm(current => ({
-        ...current,
-        path,
-        name: current.name || path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '',
-      }))
-    } catch (err) { setError(String(err)) }
-  }
-  async function submit(event) {
-    event.preventDefault()
-    setError('')
-    if (!form.name.trim() || !form.path.trim()) {
-      setError('Enter a project name and choose a local project folder.')
-      return
-    }
-    setBusy(true)
-    try { await onSave(form, project?.ID) }
-    catch (err) { setError(String(err)) }
-    finally { setBusy(false) }
-  }
-
-  return (
-    <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
-      <form className="modal project-modal" onSubmit={submit}>
-        <div className="modal-head">
-          <h3 id="project-modal-title">{isEdit ? 'Edit project' : 'Add local project'}</h3>
-          <button type="button" className="icon-btn dark" onClick={onClose} disabled={busy}>✕</button>
-        </div>
-        <div className="modal-body">
-          <Field label="Project name *" value={form.name} onChange={set('name')} placeholder="e.g. local-vault" autoFocus disabled={busy} />
-          <div className="field">
-            <label>Local folder *</label>
-            <div className="project-path-picker">
-              <input value={form.path} onChange={set('path')} placeholder="Choose a project folder" disabled={busy} />
-              <button type="button" className="btn btn-ghost btn-sm" onClick={chooseDirectory} disabled={busy}>Choose…</button>
-            </div>
-          </div>
-          <Field label="Project notes" value={form.description} onChange={set('description')} placeholder="What is this project for?" textarea disabled={busy} />
-          <Field label="Tags" value={form.tags} onChange={set('tags')} placeholder="Go, React, tools (comma separated)" disabled={busy} />
-          {error && <div className="err-box">{error}</div>}
-          <div className="modal-foot">
-            <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
-            <button type="submit" className="btn btn-primary" disabled={busy}>{busy ? 'Saving…' : isEdit ? 'Save changes' : 'Add to Workspace'}</button>
-          </div>
-        </div>
-      </form>
-    </div>
-  )
-}
-
-const PROJECT_PALETTE = ['#4f46e5', '#0f766e', '#b45309', '#be123c', '#0369a1', '#6d28d9']
-const OPEN_TARGET_NAMES = { explorer: 'File Explorer', vscode: 'VS Code', sublime: 'Sublime Text', terminal: 'Terminal', 'terminal-wt': 'Windows Terminal', 'terminal-pwsh': 'PowerShell 7', 'terminal-cmd': 'Command Prompt' }
-const OPEN_TARGET_ICONS = { explorer: '▣', vscode: '⌘', sublime: 'S', terminal: '›_', 'terminal-wt': '▣', 'terminal-pwsh': '>_', 'terminal-cmd': 'C:' }
-function projectColor(name = '') {
-  let hash = 0
-  for (let i = 0; i < name.length; i++) hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0
-  return PROJECT_PALETTE[Math.abs(hash) % PROJECT_PALETTE.length]
-}
-
-function fmtShortDateTime(iso) {
-  try { return new Date(iso).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) } catch { return iso }
 }
 
 function UserManagementModal({ onClose }) {

@@ -6,15 +6,12 @@ export function AddCategory(arg1:string):Promise<number>;
 
 export function AddEntry(arg1:number,arg2:string,arg3:string,arg4:string,arg5:string,arg6:string,arg7:string):Promise<void>;
 
-export function AddProject(arg1:string,arg2:string,arg3:string,arg4:string):Promise<number>;
 
-export function ChooseProjectDirectory():Promise<string>;
 
 export function DeleteCategory(arg1:number):Promise<void>;
 
 export function DeleteEntries(arg1:Array<string>,arg2:string):Promise<void>;
 
-export function DeleteProject(arg1:number):Promise<void>;
 
 export function ExportVault(arg1:string):Promise<main.ExportResult>;
 
@@ -36,13 +33,10 @@ export function IsUnlocked():Promise<boolean>;
 
 export function ListEntries(arg1:number):Promise<Array<main.Entry>>;
 
-export function ListProjects():Promise<Array<main.Project>>;
 
 export function Lock():Promise<void>;
 
-export function OpenProject(arg1:number):Promise<void>;
 
-export function OpenProjectWith(arg1:number,arg2:string):Promise<void>;
 
 export function RenameCategory(arg1:number,arg2:string):Promise<void>;
 
@@ -51,5 +45,3 @@ export function SearchEntries(arg1:string):Promise<Array<main.Entry>>;
 export function Unlock(arg1:string):Promise<void>;
 
 export function UpdateEntry(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string,arg6:string,arg7:string,arg8:string):Promise<void>;
-
-export function UpdateProject(arg1:number,arg2:string,arg3:string,arg4:string,arg5:string):Promise<void>;

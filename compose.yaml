@@ -5,8 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        VITE_BASE_PATH: ${DEVHUB_BASE_PATH:-/}
     image: local/devhub:latest
     container_name: devhub
     restart: unless-stopped
@@ -17,15 +15,11 @@ services:
     environment:
       HOME: /data
       TZ: ${TZ:-Asia/Shanghai}
-      DEVHUB_CONTAINER: "1"
+      DEVHUB_BASE_PATH: ${DEVHUB_BASE_PATH:-/}
       DEVHUB_ALLOW_INSECURE_LOCAL: "1"
       DEVHUB_REQUIRE_HTTPS: ${DEVHUB_REQUIRE_HTTPS:-1}
     volumes:
       - devhub-data:/data
-      - type: bind
-        source: ${DEVHUB_PROJECTS_DIR:-..}
-        target: /projects
-        read_only: true
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777

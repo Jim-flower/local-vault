@@ -112,30 +112,6 @@ export namespace main {
 	        this.ImportedCategories = source["ImportedCategories"];
 	    }
 	}
-	export class Project {
-	    ID: number;
-	    Name: string;
-	    Path: string;
-	    Description: string;
-	    Tags: string;
-	    CreatedAt: string;
-	    LastOpenedAt: string;
-
-	    static createFrom(source: any = {}) {
-	        return new Project(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ID = source["ID"];
-	        this.Name = source["Name"];
-	        this.Path = source["Path"];
-	        this.Description = source["Description"];
-	        this.Tags = source["Tags"];
-	        this.CreatedAt = source["CreatedAt"];
-	        this.LastOpenedAt = source["LastOpenedAt"];
-	    }
-	}
 	export class TOTPResult {
 	    Code: string;
 	    SecondsLeft: number;

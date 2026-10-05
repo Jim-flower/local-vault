@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"io/fs"
 	"mime/multipart"
 	"net/http"
@@ -14,18 +13,12 @@ import (
 func newWebTestApp(t *testing.T) *App {
 	t.Helper()
 	root := t.TempDir()
-	projects, err := OpenProjectStore(filepath.Join(root, "projects.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	vault, err := OpenStore(filepath.Join(root, "vault.db"))
 	if err != nil {
-		projects.Close()
 		t.Fatal(err)
 	}
-	app := &App{projectStore: projects, store: vault, webMode: true}
+	app := &App{store: vault}
 	t.Cleanup(func() {
-		_ = projects.Close()
 		_ = vault.Close()
 	})
 	return app
@@ -114,8 +107,8 @@ func TestWebRouterRequiresSignIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "test-token", webFS, false, true)
-	request := httptest.NewRequest(http.MethodPost, "/api/ListProjects", bytes.NewBufferString(`{"args":[]}`))
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: false, LocalOnly: true})
+	request := httptest.NewRequest(http.MethodPost, "/api/IsInitialized", bytes.NewBufferString(`{"args":[]}`))
 	request.RemoteAddr = "127.0.0.1:12345"
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
@@ -124,45 +117,13 @@ func TestWebRouterRequiresSignIn(t *testing.T) {
 	}
 }
 
-func TestWebRouterListsProjects(t *testing.T) {
-	app := newWebTestApp(t)
-	projectPath := t.TempDir()
-	if _, err := app.AddProject("Web Test", projectPath, "browser mode", "web"); err != nil {
-		t.Fatal(err)
-	}
-	webFS, err := fs.Sub(assets, "frontend/dist")
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := webRouter(app, "test-token", webFS, false, true)
-	cookie := bootstrapWeb(t, router, false)
-	request := httptest.NewRequest(http.MethodPost, "/api/ListProjects", bytes.NewBufferString(`{"args":[]}`))
-	request.RemoteAddr = "127.0.0.1:12345"
-	request.AddCookie(cookie)
-	response := httptest.NewRecorder()
-	router.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
-	}
-	var payload struct {
-		Result []Project `json:"result"`
-		Error  string    `json:"error"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Error != "" || len(payload.Result) != 1 || payload.Result[0].Name != "Web Test" {
-		t.Fatalf("unexpected response: %#v", payload)
-	}
-}
-
-func TestWorkspaceRouterRejectsSecureRemoteRequests(t *testing.T) {
+func TestMaintenanceRouterRejectsSecureRemoteRequests(t *testing.T) {
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "container-token", webFS, true, true)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: true})
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	request.RemoteAddr = "192.0.2.10:12345"
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -173,14 +134,14 @@ func TestWorkspaceRouterRejectsSecureRemoteRequests(t *testing.T) {
 	}
 }
 
-func TestWorkspaceRouterAllowsDockerLoopbackForwardingOnlyWithLocalHost(t *testing.T) {
+func TestMaintenanceRouterAllowsDockerLoopbackForwardingOnlyWithLocalHost(t *testing.T) {
 	t.Setenv("DEVHUB_ALLOW_INSECURE_LOCAL", "1")
 	app := newWebTestApp(t)
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "", webFS, true, true)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: true})
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	request.RemoteAddr = "172.18.0.1:12345"
 	request.Host = "localhost:8787"
@@ -207,7 +168,7 @@ func TestWebRouterRejectsRemoteHTTPByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "test-token", webFS, false, true)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: false, LocalOnly: true})
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	request.RemoteAddr = "192.0.2.10:12345"
 	response := httptest.NewRecorder()
@@ -224,7 +185,7 @@ func TestVaultOnlyRouterRejectsRemoteHTTPEvenWhenRemoteAccessEnabled(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "", webFS, true, false)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	request.RemoteAddr = "192.0.2.10:12345"
 	response := httptest.NewRecorder()
@@ -240,7 +201,7 @@ func TestVaultOnlyRouterRejectsInitialAdminSetup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "", webFS, true, false)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
 	request := httptest.NewRequest(http.MethodPost, "/api/auth/bootstrap", bytes.NewBufferString(`{"Username":"admin","Password":"account-password","MasterPassword":"master-password"}`))
 	request.RemoteAddr = "192.0.2.10:12345"
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -257,7 +218,7 @@ func TestSecureGatewayResponseSetsSecurityHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "", webFS, true, false)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.RemoteAddr = "192.0.2.10:12345"
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -287,7 +248,7 @@ func TestSecureGatewayRejectsCrossOriginMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := webRouter(app, "", webFS, true, false)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
 	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"account-password"}`))
 	request.RemoteAddr = "192.0.2.10:12345"
 	request.Header.Set("X-Forwarded-Proto", "https")
@@ -306,9 +267,9 @@ func TestAuthenticationFailuresAreThrottled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	localRouter := webRouter(app, "", webFS, false, true)
+	localRouter := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: false, LocalOnly: true})
 	bootstrapWeb(t, localRouter, false)
-	router := webRouter(app, "", webFS, true, false)
+	router := webRouter(app, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
 	for attempt := 1; attempt <= authFailureLimit; attempt++ {
 		request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(`{"Username":"admin","Password":"wrong-password"}`))
 		request.RemoteAddr = "192.0.2.10:12345"
@@ -333,64 +294,14 @@ func TestAuthenticationFailuresAreThrottled(t *testing.T) {
 	}
 }
 
-func TestVaultOnlyWebRouterHidesAndRejectsWorkspace(t *testing.T) {
-	app := newWebTestApp(t)
-	webFS, err := fs.Sub(assets, "frontend/dist")
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := webRouter(app, "vault-token", webFS, true, false)
-	localRouter := webRouter(app, "", webFS, false, true)
-	bootstrapWeb(t, localRouter, false)
-
-	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
-	sessionRequest.RemoteAddr = "192.0.2.10:12345"
-	sessionRequest.Header.Set("X-Forwarded-Proto", "https")
-	sessionResponse := httptest.NewRecorder()
-	router.ServeHTTP(sessionResponse, sessionRequest)
-	if sessionResponse.Code != http.StatusOK {
-		t.Fatalf("session status = %d", sessionResponse.Code)
-	}
-	var session struct {
-		Result authStatus `json:"result"`
-	}
-	if err := json.Unmarshal(sessionResponse.Body.Bytes(), &session); err != nil {
-		t.Fatal(err)
-	}
-	if session.Result.Workspace {
-		t.Fatal("Vault-only session exposed Workspace capability")
-	}
-	cookie := loginWeb(t, router, true)
-
-	projectRequest := httptest.NewRequest(http.MethodPost, "/api/ListProjects", bytes.NewBufferString(`{"args":[]}`))
-	projectRequest.RemoteAddr = "192.0.2.10:12345"
-	projectRequest.Header.Set("X-Forwarded-Proto", "https")
-	projectRequest.AddCookie(cookie)
-	projectResponse := httptest.NewRecorder()
-	router.ServeHTTP(projectResponse, projectRequest)
-	if projectResponse.Code != http.StatusForbidden {
-		t.Fatalf("Workspace status = %d, want %d; body = %s", projectResponse.Code, http.StatusForbidden, projectResponse.Body.String())
-	}
-
-	vaultRequest := httptest.NewRequest(http.MethodPost, "/api/IsInitialized", bytes.NewBufferString(`{"args":[]}`))
-	vaultRequest.RemoteAddr = "192.0.2.10:12345"
-	vaultRequest.Header.Set("X-Forwarded-Proto", "https")
-	vaultRequest.AddCookie(cookie)
-	vaultResponse := httptest.NewRecorder()
-	router.ServeHTTP(vaultResponse, vaultRequest)
-	if vaultResponse.Code != http.StatusOK {
-		t.Fatalf("Vault status = %d, body = %s", vaultResponse.Code, vaultResponse.Body.String())
-	}
-}
-
 func TestWebVaultExportImportRoundTrip(t *testing.T) {
 	webFS, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		t.Fatal(err)
 	}
 	source := newWebTestApp(t)
-	sourceRouter := webRouter(source, "source-token", webFS, true, false)
-	sourceLocalRouter := webRouter(source, "", webFS, false, true)
+	sourceRouter := webRouter(source, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
+	sourceLocalRouter := webRouter(source, webFS, webOptions{BasePath: "/", AllowRemote: false, LocalOnly: true})
 	bootstrapWeb(t, sourceLocalRouter, false)
 	sourceCookie := loginWeb(t, sourceRouter, true)
 	unlockWeb(t, sourceRouter, sourceCookie, true)
@@ -415,8 +326,8 @@ func TestWebVaultExportImportRoundTrip(t *testing.T) {
 	}
 
 	target := newWebTestApp(t)
-	targetRouter := webRouter(target, "target-token", webFS, true, false)
-	targetLocalRouter := webRouter(target, "", webFS, false, true)
+	targetRouter := webRouter(target, webFS, webOptions{BasePath: "/", AllowRemote: true, LocalOnly: false})
+	targetLocalRouter := webRouter(target, webFS, webOptions{BasePath: "/", AllowRemote: false, LocalOnly: true})
 	bootstrapWeb(t, targetLocalRouter, false)
 	targetCookie := loginWeb(t, targetRouter, true)
 	unlockWeb(t, targetRouter, targetCookie, true)

@@ -10,24 +10,12 @@ export function AddEntry(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
   return window['go']['main']['App']['AddEntry'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
-export function AddProject(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['AddProject'](arg1, arg2, arg3, arg4);
-}
-
-export function ChooseProjectDirectory() {
-  return window['go']['main']['App']['ChooseProjectDirectory']();
-}
-
 export function DeleteCategory(arg1) {
   return window['go']['main']['App']['DeleteCategory'](arg1);
 }
 
 export function DeleteEntries(arg1, arg2) {
   return window['go']['main']['App']['DeleteEntries'](arg1, arg2);
-}
-
-export function DeleteProject(arg1) {
-  return window['go']['main']['App']['DeleteProject'](arg1);
 }
 
 export function ExportVault(arg1) {
@@ -70,20 +58,8 @@ export function ListEntries(arg1) {
   return window['go']['main']['App']['ListEntries'](arg1);
 }
 
-export function ListProjects() {
-  return window['go']['main']['App']['ListProjects']();
-}
-
 export function Lock() {
   return window['go']['main']['App']['Lock']();
-}
-
-export function OpenProject(arg1) {
-  return window['go']['main']['App']['OpenProject'](arg1);
-}
-
-export function OpenProjectWith(arg1, arg2) {
-  return window['go']['main']['App']['OpenProjectWith'](arg1, arg2);
 }
 
 export function RenameCategory(arg1, arg2) {
@@ -100,8 +76,4 @@ export function Unlock(arg1) {
 
 export function UpdateEntry(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
   return window['go']['main']['App']['UpdateEntry'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
-}
-
-export function UpdateProject(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['UpdateProject'](arg1, arg2, arg3, arg4, arg5);
 }

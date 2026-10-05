@@ -1,9 +1,7 @@
 import * as wails from '../wailsjs/go/main/App'
 
-// Vite's BASE_URL is derived from VITE_BASE_PATH and always includes the
-// trailing slash. Keeping all browser requests behind this helper lets a
-// gateway mount the app below a path while the Go server still sees /api/.
-export const BASE_PATH = import.meta.env.BASE_URL || '/'
+// The HTTP server injects a base element at runtime; desktop builds use /.
+export const BASE_PATH = document.querySelector('base')?.getAttribute('href') || '/'
 export function withBasePath(path) {
   return `${BASE_PATH}${String(path).replace(/^\/+/, '')}`
 }
@@ -78,7 +76,6 @@ function chooseVaultZip() {
 }
 
 export const IsInitialized = () => invoke('IsInitialized', [])
-export const IsWebApp = () => !inWails()
 export const GetAuthStatus = async () => {
   if (inWails()) return null
   return auth('/status')
@@ -95,11 +92,6 @@ export const CreateUser = (username, password) => auth('/users/create', {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
 })
 export const RemoveUser = id => auth(`/users/${id}`, { method: 'DELETE' })
-export const GetWebCapabilities = async () => {
-  if (inWails()) return { workspace: true }
-  const status = await GetAuthStatus()
-  return { workspace: status.workspace !== false }
-}
 export const IsUnlocked = () => invoke('IsUnlocked', [])
 export const Initialize = (...args) => invoke('Initialize', args)
 export const Unlock = (...args) => invoke('Unlock', args)
@@ -148,10 +140,3 @@ export const ImportVault = async zipPassword => {
   if (payload.error) throw new Error(payload.error)
   return payload.result
 }
-export const ListProjects = () => invoke('ListProjects', [])
-export const AddProject = (...args) => invoke('AddProject', args)
-export const UpdateProject = (...args) => invoke('UpdateProject', args)
-export const DeleteProject = (...args) => invoke('DeleteProject', args)
-export const ChooseProjectDirectory = () => invoke('ChooseProjectDirectory', [])
-export const OpenProject = (...args) => invoke('OpenProject', args)
-export const OpenProjectWith = (...args) => invoke('OpenProjectWith', args)
