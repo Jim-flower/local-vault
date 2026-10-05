@@ -1,5 +1,7 @@
 # Vault deployment
 
+中文使用、初始化、备份及部署说明见 [README.md](README.md)。
+
 Vault runs an HTTP server; your gateway terminates TLS. The same image supports
 root-path and subpath deployments through runtime configuration.
 
