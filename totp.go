@@ -28,7 +28,10 @@ func GenerateTOTP(secret string) (*TOTPResult, error) {
 	now := time.Now().Unix()
 	counter := uint64(now / 30)
 	secondsLeft := int(30 - now%30)
+	return &TOTPResult{Code: totpCode(key, counter), SecondsLeft: secondsLeft}, nil
+}
 
+func totpCode(key []byte, counter uint64) string {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, counter)
 
@@ -42,8 +45,5 @@ func GenerateTOTP(secret string) (*TOTPResult, error) {
 		int(h[offset+2])<<8 |
 		int(h[offset+3])) % 1_000_000
 
-	return &TOTPResult{
-		Code:        fmt.Sprintf("%06d", code),
-		SecondsLeft: secondsLeft,
-	}, nil
+	return fmt.Sprintf("%06d", code)
 }

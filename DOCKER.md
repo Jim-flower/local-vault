@@ -9,8 +9,16 @@ root-path and subpath deployments through runtime configuration.
 
 ```bash
 cp .env.example .env
-docker compose up -d --build
+docker compose build app
+docker compose run --rm --no-deps app -generate-login-2fa-secret
 ```
+
+The generator prints a new Base32 key without starting Vault. Add that key to
+your phone authenticator (TOTP, SHA-1, 6 digits, 30 seconds), set
+`DEVHUB_ADMIN_TOTP_SECRET` to it in `.env`, then run `docker compose up -d`.
+Compose defaults to `DEVHUB_REQUIRE_LOGIN_2FA=1`: a missing or invalid key causes
+startup to fail. Set the flag to `0` only to explicitly disable login 2FA.
+The environment holds the long-lived secret, not a changing six-digit code.
 
 - `http://localhost:8787/`: local maintenance and first administrator setup.
 - `http://127.0.0.1:8788/`: public Vault upstream for a trusted HTTPS gateway.
@@ -21,6 +29,19 @@ Both host ports are bound to loopback. All Vault data stays in the existing
 First create the `admin` account through port 8787. There is no default password.
 The account password and Vault master password must each have at least 12
 characters. The public listener refuses initial administrator creation.
+
+This is a single-user application: only `admin` can sign in. Legacy member
+records are retained but no longer authenticate, and user-management endpoints
+have been removed. When 2FA is enabled, both listeners require a phone code at
+login and the maintenance listener also requires one during initial setup.
+Successful codes cannot be reused, including after a service restart.
+
+The login secret stays in process configuration; it is not returned to the
+browser or saved to the database. To rotate it or recover from a lost phone,
+generate a new key, update your authenticator and `.env`, then recreate the
+container with `docker compose up -d`. Account and master passwords are unchanged.
+Native Web processes accept the same exported environment variables; without an
+explicit `DEVHUB_REQUIRE_LOGIN_2FA=1`, native login 2FA defaults to disabled.
 
 Project management has been removed. Existing `.devhub.db` files are left alone
 but are no longer opened. There is no `/projects` mount or project launcher.

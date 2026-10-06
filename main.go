@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,7 +26,16 @@ func main() {
 	noOpen := flag.Bool("no-open", false, "do not open the browser automatically")
 	allowRemote := flag.Bool("allow-remote", false, "allow browser requests forwarded by a gateway or reverse proxy")
 	basePath := flag.String("base-path", os.Getenv("DEVHUB_BASE_PATH"), "public Vault URL prefix (default /); gateway must preserve it")
+	generateSecret := flag.Bool("generate-login-2fa-secret", false, "generate a Base32 login 2FA secret and exit without starting Vault")
 	flag.Parse()
+	if *generateSecret {
+		secret, err := generateLoginTwoFASecret()
+		if err != nil {
+			log.Fatal("could not generate login 2FA secret")
+		}
+		fmt.Println(secret)
+		return
+	}
 	if *webMode || strings.Contains(strings.ToLower(filepath.Base(os.Args[0])), "web-server") {
 		app := NewApp()
 		if err := runWebMode(app, *host, *port, *remoteVaultPort, !*noOpen, *allowRemote, *basePath); err != nil {

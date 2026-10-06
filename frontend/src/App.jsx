@@ -8,7 +8,6 @@ import {
   GetCategories, AddCategory, DeleteCategory,
   ListEntries, SearchEntries, AddEntry, UpdateEntry, DeleteEntries,
   GeneratePassword, GetTOTPCode, GetEntryHistory, ExportVault, ImportVault,
-  ListUsers, CreateUser, RemoveUser,
 } from './bridge'
 
 async function copyText(text) {
@@ -34,11 +33,13 @@ async function copyText(text) {
 export default function App() {
   const [screen, setScreen] = useState('loading')
   const [currentUser, setCurrentUser] = useState(null)
+  const [twoFARequired, setTwoFARequired] = useState(false)
 
   useEffect(() => {
     GetAuthStatus()
       .then(async status => {
         if (status) {
+          setTwoFARequired(status.login2FARequired === true)
           setCurrentUser(status.user || null)
           if (status.bootstrap) { setScreen('admin-setup'); return }
           if (!status.authenticated) { setScreen('login'); return }
@@ -59,8 +60,8 @@ export default function App() {
   }
 
   if (screen === 'loading') return <Splash />
-  if (screen === 'admin-setup') return <AdminSetupScreen onDone={user => { setCurrentUser(user); setScreen('vault') }} />
-  if (screen === 'login') return <LoginScreen onDone={user => { setCurrentUser(user); setScreen('locked') }} />
+  if (screen === 'admin-setup') return <AdminSetupScreen twoFARequired={twoFARequired} onDone={user => { setCurrentUser(user); setScreen('vault') }} />
+  if (screen === 'login') return <LoginScreen twoFARequired={twoFARequired} onDone={user => { setCurrentUser(user); setScreen('locked') }} />
   if (screen === 'setup')   return <LockScreen mode="setup"  onDone={() => setScreen('vault')} />
   if (screen === 'locked')  return <LockScreen mode="unlock" onDone={() => setScreen('vault')} />
   if (screen === 'vault')   return <VaultScreen user={currentUser} onLogout={async () => { await Logout(); setCurrentUser(null); setScreen('login') }} onLock={() => setScreen('locked')} />
@@ -82,29 +83,41 @@ function AuthShell({ title, subtitle, children }) {
   return <div className="lock-bg"><main className="lock-card auth-card"><div className="lock-mark">&#128272;</div><h1>{title}</h1><p className="lock-sub">{subtitle}</p>{children}</main></div>
 }
 
-function LoginScreen({ onDone }) {
-  const [username, setUsername] = useState('')
+function LoginCodeField({ value, onChange, disabled }) {
+  return <div className="field">
+    <label htmlFor="login-2fa-code">Authenticator code</label>
+    <input id="login-2fa-code" type="text" inputMode="numeric" autoComplete="one-time-code"
+      pattern="[0-9]{6}" maxLength={6} required value={value} disabled={disabled}
+      onChange={event => onChange(event.target.value.replace(/\D/g, '').slice(0, 6))}
+      placeholder="6-digit code" />
+  </div>
+}
+
+function LoginScreen({ onDone, twoFARequired }) {
+  const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   async function submit(event) {
     event.preventDefault(); setError(''); setBusy(true)
-    try { const result = await Login(username, password); onDone(result.User) }
+    try { const result = await Login(password, code); onDone(result.user) }
     catch (err) { setError(String(err)) }
     finally { setBusy(false) }
   }
-  return <AuthShell title="Sign in" subtitle="Use your Vault account to continue.">
+  return <AuthShell title="Sign in" subtitle="Sign in to your personal Vault.">
     <form onSubmit={submit}>
-      <Field label="Username" value={username} onChange={event => setUsername(event.target.value)} autoFocus disabled={busy} />
-      <Field label="Account password" type="password" value={password} onChange={event => setPassword(event.target.value)} disabled={busy} />
+      <div className="account-name">Account: <strong>admin</strong></div>
+      <Field label="Account password" type="password" value={password} onChange={event => setPassword(event.target.value)} autoFocus disabled={busy} />
+      {twoFARequired && <LoginCodeField value={code} onChange={setCode} disabled={busy} />}
       {error && <div className="err-box">{error}</div>}
       <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
     </form>
   </AuthShell>
 }
 
-function AdminSetupScreen({ onDone }) {
+function AdminSetupScreen({ onDone, twoFARequired }) {
   const [accountPassword, setAccountPassword] = useState('')
+  const [code, setCode] = useState('')
   const [accountConfirm, setAccountConfirm] = useState('')
   const [masterPassword, setMasterPassword] = useState('')
   const [masterConfirm, setMasterConfirm] = useState('')
@@ -117,7 +130,7 @@ function AdminSetupScreen({ onDone }) {
     if (!masterPassword) { setError('Enter a vault master password.'); return }
     if (masterPassword !== masterConfirm) { setError('Master passwords do not match.'); return }
     setBusy(true)
-    try { const result = await BootstrapAdmin('admin', accountPassword, masterPassword); onDone(result.User) }
+    try { const result = await BootstrapAdmin(accountPassword, masterPassword, code); onDone(result.user) }
     catch (err) { setError(String(err)) }
     finally { setBusy(false) }
   }
@@ -130,6 +143,7 @@ function AdminSetupScreen({ onDone }) {
       <Field label="Vault master password" type="password" value={masterPassword} onChange={event => setMasterPassword(event.target.value)} disabled={busy} />
       <Field label="Confirm master password" type="password" value={masterConfirm} onChange={event => setMasterConfirm(event.target.value)} disabled={busy} />
       {error && <div className="err-box">{error}</div>}
+      {twoFARequired && <LoginCodeField value={code} onChange={setCode} disabled={busy} />}
       <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Creating...' : 'Create secure vault'}</button>
     </form>
   </AuthShell>
@@ -200,7 +214,6 @@ function VaultScreen({ user, onLogout, onLock }) {
   const [selectedNames, setSelectedNames] = useState([])
   const [deleteTargets, setDeleteTargets] = useState(null)
   const [transferMode, setTransferMode] = useState(null) // null | 'export' | 'import'
-  const [userManagerOpen, setUserManagerOpen] = useState(false)
 
   useEffect(() => { loadCategories() }, [])
   useEffect(() => { if (!search.trim()) loadEntries() }, [activeCat])
@@ -318,7 +331,6 @@ function VaultScreen({ user, onLogout, onLock }) {
         <div className="sb-top">
           <span className="brand">◈ DevHub</span>
           <div className="sidebar-actions">
-            {user?.Role === 'superadmin' && <button className="icon-btn" title="Manage users" onClick={() => setUserManagerOpen(true)}>⚙</button>}
             <button className="icon-btn" title="Lock vault" onClick={async () => { await Lock(); onLock() }}>⏏</button>
           </div>
         </div>
@@ -507,57 +519,11 @@ function VaultScreen({ user, onLogout, onLock }) {
         />
       )}
 
-      {userManagerOpen && <UserManagementModal onClose={() => setUserManagerOpen(false)} />}
 
       {toast && <div className="toast">{toast}</div>}
     </div>
   )
 }
-
-function UserManagementModal({ onClose }) {
-  const [users, setUsers] = useState([])
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState('')
-  const [busy, setBusy] = useState(false)
-  async function loadUsers() {
-    try { setUsers((await ListUsers()) || []) } catch (err) { setError(String(err)) }
-  }
-  useEffect(() => { loadUsers() }, [])
-  async function addUser(event) {
-    event.preventDefault(); setError('')
-    if (!username.trim() || password.length < 12) { setError('Enter a username and an account password of at least 12 characters.'); return }
-    setBusy(true)
-    try { await CreateUser(username, password); setUsername(''); setPassword(''); await loadUsers() }
-    catch (err) { setError(String(err)) }
-    finally { setBusy(false) }
-  }
-  async function removeUser(user) {
-    if (!window.confirm(`Remove ${user.Username}'s account? They will lose access immediately.`)) return
-    setError('')
-    try { await RemoveUser(user.ID); await loadUsers() }
-    catch (err) { setError(String(err)) }
-  }
-  return <div className="backdrop" role="dialog" aria-modal="true" aria-labelledby="users-title">
-    <div className="modal users-modal">
-      <div className="modal-head"><h3 id="users-title">User access</h3><button className="icon-btn dark" onClick={onClose}>✕</button></div>
-      <div className="modal-body">
-        <div className="user-list">
-          {users.map(user => <div className="user-row" key={user.ID}><div><strong>{user.Username}</strong><span>{user.Role === 'superadmin' ? 'Super administrator' : 'Member'}</span></div>{user.Role !== 'superadmin' && <button className="copy-btn" onClick={() => removeUser(user)}>Remove</button>}</div>)}
-        </div>
-        <form className="add-user-form" onSubmit={addUser}>
-          <div className="form-divider">Add user</div>
-          <Field label="Username" value={username} onChange={event => setUsername(event.target.value)} disabled={busy} />
-          <Field label="Account password" type="password" value={password} onChange={event => setPassword(event.target.value)} disabled={busy} />
-          {error && <div className="err-box">{error}</div>}
-          <div className="modal-foot"><button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Close</button><button className="btn btn-primary" disabled={busy}>{busy ? 'Adding...' : 'Add user'}</button></div>
-        </form>
-      </div>
-    </div>
-  </div>
-}
-
-// ── Encrypted import / export ────────────────────────────────────────────────
 
 function TransferModal({ mode, onExport, onImport, onClose }) {
   const isExport = mode === 'export'

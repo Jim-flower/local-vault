@@ -52,39 +52,43 @@ func TestDeleteEntriesRequiresPasswordAndIsAtomic(t *testing.T) {
 	}
 }
 
-func TestUserAccountsRequireAdminBootstrapAndStrongPasswords(t *testing.T) {
+func TestSingleAdminAccountAndLegacyMemberRejection(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "vault.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 
-	if err := store.CreateFirstSuperAdmin("owner", "long-enough-password"); err == nil {
+	if err := store.CreateAdmin("owner", "long-enough-password"); err == nil {
 		t.Fatal("accepted a first administrator username other than admin")
 	}
-	if err := store.CreateFirstSuperAdmin("admin", "short"); err == nil {
+	if err := store.CreateAdmin("admin", "short"); err == nil {
 		t.Fatal("accepted a short administrator password")
 	}
-	if err := store.CreateFirstSuperAdmin("admin", "admin-account-password"); err != nil {
+	if err := store.CreateAdmin("admin", "admin-account-password"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AuthenticateUser("admin", "wrong-password"); err == nil {
+	if _, err := store.AuthenticateAdmin("admin", "wrong-password"); err == nil {
 		t.Fatal("accepted incorrect administrator password")
 	}
-	admin, err := store.AuthenticateUser("admin", "admin-account-password")
+	admin, err := store.AuthenticateAdmin("admin", "admin-account-password")
 	if err != nil || admin.Role != superAdminRole {
 		t.Fatalf("AuthenticateUser admin = %#v, %v", admin, err)
 	}
-	member, err := store.CreateUser("alice", "member-account-password")
-	if err != nil || member.Role != memberRole {
-		t.Fatalf("CreateUser = %#v, %v", member, err)
+	if err := store.CreateAdmin("admin", "another-account-password"); err == nil {
+		t.Fatal("replaced an existing administrator")
 	}
-	if err := store.DeleteUser(admin.ID); err == nil {
-		t.Fatal("deleted the super administrator")
-	}
-	if err := store.DeleteUser(member.ID); err != nil {
+	// A legacy member with exactly the administrator's credentials is still
+	// unable to authenticate after upgrading to the single-user application.
+	_, err = store.db.Exec(`INSERT INTO users (username,password_salt,password_hash,role,created_at)
+        SELECT 'alice',password_salt,password_hash,'member',created_at FROM users WHERE username='admin'`)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.AuthenticateAdmin("alice", "admin-account-password"); err == nil {
+		t.Fatal("legacy member can still log in")
+	}
+
 }
 
 func TestEncryptedZIPExportAndImport(t *testing.T) {

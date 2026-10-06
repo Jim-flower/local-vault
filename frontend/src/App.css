@@ -589,16 +589,6 @@ body {
   border: 0; padding: 0; background: transparent; color: #c7d2fe;
   font: 600 .7rem var(--font); cursor: pointer;
 }
-.users-modal { max-width: 520px; }
-.user-list { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
-.user-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px;
-  padding: 11px 12px; background: var(--input-bg);
-}
-.user-row + .user-row { border-top: 1px solid var(--border); }
-.user-row strong, .user-row span { display: block; }
-.user-row strong { font-size: .85rem; }
-.user-row span { margin-top: 2px; color: var(--muted); font-size: .72rem; }
 
 /* ── Responsive Vault layout ────────────────────────────────────────────── */
 @media (max-width: 760px) {

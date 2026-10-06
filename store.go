@@ -104,7 +104,6 @@ type Store struct {
 }
 
 const superAdminRole = "superadmin"
-const memberRole = "member"
 
 // User is deliberately limited to fields that are safe to return to the UI.
 type User struct {
@@ -119,6 +118,8 @@ func OpenStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Keep foreign-key settings and atomic OTP consumption on one connection.
+	db.SetMaxOpenConns(1)
 	db.Exec("PRAGMA foreign_keys = ON")
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -168,59 +169,44 @@ func (s *Store) IsInitialized() (bool, error) {
 	return n > 0, err
 }
 
-func (s *Store) HasUsers() (bool, error) {
+func (s *Store) HasAdmin() (bool, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE username='admin' AND role='superadmin'`).Scan(&count)
 	return count > 0, err
 }
 
-func (s *Store) CreateFirstSuperAdmin(username, password string) error {
+func (s *Store) CreateAdmin(username, password string) error {
 	username = strings.TrimSpace(username)
 	if username != "admin" {
 		return errors.New("the first super administrator username must be admin")
 	}
-	hasUsers, err := s.HasUsers()
+	hasUsers, err := s.HasAdmin()
 	if err != nil {
 		return err
 	}
 	if hasUsers {
 		return errors.New("an administrator already exists")
 	}
-	_, err = s.createUser(username, password, superAdminRole)
-	return err
-}
-
-func (s *Store) CreateUser(username, password string) (*User, error) {
-	return s.createUser(username, password, memberRole)
-}
-
-func (s *Store) createUser(username, password, role string) (*User, error) {
-	username = strings.TrimSpace(username)
-	if username == "" || len(username) > 64 {
-		return nil, errors.New("username must be between 1 and 64 characters")
-	}
 	if len(password) < 12 {
-		return nil, errors.New("password must be at least 12 characters")
+		return errors.New("password must be at least 12 characters")
 	}
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
-		return nil, err
+		return err
 	}
 	hash := deriveKey([]byte(password), salt)
 	now := time.Now().UTC().Format(time.RFC3339)
-	result, err := s.db.Exec(`INSERT INTO users (username,password_salt,password_hash,role,created_at) VALUES (?,?,?,?,?)`, username, hex.EncodeToString(salt), hex.EncodeToString(hash), role, now)
-	if err != nil {
-		return nil, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
-	return &User{ID: id, Username: username, Role: role, CreatedAt: now}, nil
+	// Retain the legacy table and role value so existing admin credentials and
+	// database backups keep working. Only this fixed account can be created.
+	_, err = s.db.Exec(`INSERT INTO users (username,password_salt,password_hash,role,created_at) VALUES (?,?,?,?,?)`, username, hex.EncodeToString(salt), hex.EncodeToString(hash), superAdminRole, now)
+	return err
 }
 
-func (s *Store) AuthenticateUser(username, password string) (*User, error) {
+func (s *Store) AuthenticateAdmin(username, password string) (*User, error) {
 	username = strings.TrimSpace(username)
+	if !strings.EqualFold(username, "admin") {
+		return nil, errors.New("incorrect username or password")
+	}
 	var user User
 	var saltHex, hashHex string
 	err := s.db.QueryRow(`SELECT id,username,password_salt,password_hash,role,created_at FROM users WHERE username=?`, username).Scan(&user.ID, &user.Username, &saltHex, &hashHex, &user.Role, &user.CreatedAt)
@@ -239,42 +225,10 @@ func (s *Store) AuthenticateUser(username, password string) (*User, error) {
 		return nil, errors.New("stored user credential is invalid")
 	}
 	actual := deriveKey([]byte(password), salt)
-	if subtle.ConstantTimeCompare(actual, expected) != 1 {
+	if user.Role != superAdminRole || subtle.ConstantTimeCompare(actual, expected) != 1 {
 		return nil, errors.New("incorrect username or password")
 	}
 	return &user, nil
-}
-
-func (s *Store) ListUsers() ([]*User, error) {
-	rows, err := s.db.Query(`SELECT id,username,role,created_at FROM users ORDER BY username COLLATE NOCASE`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	users := make([]*User, 0)
-	for rows.Next() {
-		user := &User{}
-		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &user.CreatedAt); err != nil {
-			return nil, err
-		}
-		users = append(users, user)
-	}
-	return users, rows.Err()
-}
-
-func (s *Store) DeleteUser(id int64) error {
-	var role string
-	if err := s.db.QueryRow(`SELECT role FROM users WHERE id=?`, id).Scan(&role); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("user not found")
-		}
-		return err
-	}
-	if role == superAdminRole {
-		return errors.New("the super administrator cannot be deleted")
-	}
-	_, err := s.db.Exec(`DELETE FROM users WHERE id=?`, id)
-	return err
 }
 
 func (s *Store) Initialize(masterPassword string) error {

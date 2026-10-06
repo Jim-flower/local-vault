@@ -40,10 +40,11 @@ type browserSessions struct {
 }
 
 type authStatus struct {
-	Bootstrap     bool  `json:"bootstrap"`
-	Authenticated bool  `json:"authenticated"`
-	User          *User `json:"user,omitempty"`
-	VaultUnlocked bool  `json:"vaultUnlocked"`
+	Bootstrap          bool  `json:"bootstrap"`
+	Authenticated      bool  `json:"authenticated"`
+	User               *User `json:"user,omitempty"`
+	VaultUnlocked      bool  `json:"vaultUnlocked"`
+	LoginTwoFARequired bool  `json:"login2FARequired"`
 }
 
 func newBrowserSessions() *browserSessions {
@@ -145,16 +146,6 @@ func (s *browserSessions) lockAll() {
 	for token, session := range s.sessions {
 		session.VaultUnlocked = false
 		s.sessions[token] = session
-	}
-	s.mu.Unlock()
-}
-
-func (s *browserSessions) invalidateUser(id int64) {
-	s.mu.Lock()
-	for token, session := range s.sessions {
-		if session.User.ID == id {
-			delete(s.sessions, token)
-		}
 	}
 	s.mu.Unlock()
 }
@@ -294,12 +285,12 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			writeWebJSON(w, http.StatusMethodNotAllowed, webResponse{Error: "method not allowed"})
 			return
 		}
-		hasUsers, err := app.store.HasUsers()
+		hasUsers, err := app.store.HasAdmin()
 		if err != nil {
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
 		}
-		status := authStatus{Bootstrap: !hasUsers && localOnly}
+		status := authStatus{Bootstrap: !hasUsers && localOnly, LoginTwoFARequired: app.loginTwoFA.required()}
 		if session, _, ok := requireBrowserSessionSilent(r, sessions); ok {
 			status.Authenticated = true
 			status.User = &session.User
@@ -308,7 +299,7 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 		writeWebJSON(w, http.StatusOK, webResponse{Result: status})
 		return
 	}
-	if r.Method != http.MethodPost && !(path == "/users" && r.Method == http.MethodGet) && !(strings.HasPrefix(path, "/users/") && r.Method == http.MethodDelete) {
+	if r.Method != http.MethodPost {
 		writeWebJSON(w, http.StatusMethodNotAllowed, webResponse{Error: "method not allowed"})
 		return
 	}
@@ -319,11 +310,11 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			writeWebJSON(w, http.StatusForbidden, webResponse{Error: "initial administrator setup is available only on the local maintenance interface"})
 			return
 		}
-		var body struct{ Username, Password, MasterPassword string }
+		var body struct{ Username, Password, MasterPassword, Code string }
 		if !decodeWebBody(w, r, &body) {
 			return
 		}
-		hasUsers, err := app.store.HasUsers()
+		hasUsers, err := app.store.HasAdmin()
 		if err != nil {
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
@@ -336,6 +327,17 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "master password must be at least 12 characters"})
 			return
 		}
+		if strings.TrimSpace(body.Username) != "admin" || len(body.Password) < 12 {
+			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "use admin and an account password of at least 12 characters"})
+			return
+		}
+		keys := authAttemptKeys(r, "admin")
+		if rejectBlockedAuth(w, sessions, keys...) {
+			return
+		}
+		if !requireLoginTwoFA(app, sessions, body.Code, keys, w) {
+			return
+		}
 		if app.IsInitialized() {
 			err = app.Unlock(body.MasterPassword)
 		} else {
@@ -345,12 +347,12 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
 			return
 		}
-		if err := app.store.CreateFirstSuperAdmin(body.Username, body.Password); err != nil {
+		if err := app.store.CreateAdmin(body.Username, body.Password); err != nil {
 			app.Lock()
 			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
 			return
 		}
-		user, err := app.store.AuthenticateUser(body.Username, body.Password)
+		user, err := app.store.AuthenticateAdmin(body.Username, body.Password)
 		if err != nil {
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
@@ -360,11 +362,12 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
 			return
 		}
+		sessions.clearAuthFailures(keys...)
 		sessions.setVaultUnlocked(token, true)
 		setSessionCookie(w, r, token)
-		writeWebJSON(w, http.StatusCreated, webResponse{Result: authStatus{Authenticated: true, User: user, VaultUnlocked: true}})
+		writeWebJSON(w, http.StatusCreated, webResponse{Result: authStatus{Authenticated: true, User: user, VaultUnlocked: true, LoginTwoFARequired: app.loginTwoFA.required()}})
 	case "/login":
-		var body struct{ Username, Password string }
+		var body struct{ Username, Password, Code string }
 		if !decodeWebBody(w, r, &body) {
 			return
 		}
@@ -372,10 +375,13 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 		if rejectBlockedAuth(w, sessions, keys...) {
 			return
 		}
-		user, err := app.store.AuthenticateUser(body.Username, body.Password)
+		user, err := app.store.AuthenticateAdmin(body.Username, body.Password)
 		if err != nil {
 			sessions.recordAuthFailure(keys...)
 			writeWebJSON(w, http.StatusUnauthorized, webResponse{Error: "incorrect username or password"})
+			return
+		}
+		if !requireLoginTwoFA(app, sessions, body.Code, keys, w) {
 			return
 		}
 		sessions.clearAuthFailures(keys...)
@@ -385,7 +391,7 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 			return
 		}
 		setSessionCookie(w, r, token)
-		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: user}})
+		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: user, LoginTwoFARequired: app.loginTwoFA.required()}})
 	case "/logout":
 		_, token, ok := requireBrowserSession(w, r, sessions)
 		if !ok {
@@ -416,56 +422,7 @@ func handleWebAuth(app *App, sessions *browserSessions, localOnly bool, w http.R
 		sessions.clearAuthFailures(keys...)
 		sessions.setVaultUnlocked(token, true)
 		writeWebJSON(w, http.StatusOK, webResponse{Result: authStatus{Authenticated: true, User: &session.User, VaultUnlocked: true}})
-	case "/users":
-		session, _, ok := requireSuperAdmin(w, r, sessions)
-		if !ok {
-			return
-		}
-		_ = session
-		users, err := app.store.ListUsers()
-		if err != nil {
-			writeWebJSON(w, http.StatusInternalServerError, webResponse{Error: err.Error()})
-			return
-		}
-		writeWebJSON(w, http.StatusOK, webResponse{Result: users})
-	case "/users/create":
-		_, _, ok := requireSuperAdmin(w, r, sessions)
-		if !ok {
-			return
-		}
-		var body struct{ Username, Password string }
-		if !decodeWebBody(w, r, &body) {
-			return
-		}
-		user, err := app.store.CreateUser(body.Username, body.Password)
-		if err != nil {
-			writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
-			return
-		}
-		writeWebJSON(w, http.StatusCreated, webResponse{Result: user})
 	default:
-		if strings.HasPrefix(path, "/users/") && r.Method == http.MethodDelete {
-			session, _, ok := requireSuperAdmin(w, r, sessions)
-			if !ok {
-				return
-			}
-			id, err := strconv.ParseInt(strings.TrimPrefix(path, "/users/"), 10, 64)
-			if err != nil || id <= 0 {
-				writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "invalid user"})
-				return
-			}
-			if id == session.User.ID {
-				writeWebJSON(w, http.StatusBadRequest, webResponse{Error: "you cannot delete your own account"})
-				return
-			}
-			if err := app.store.DeleteUser(id); err != nil {
-				writeWebJSON(w, http.StatusBadRequest, webResponse{Error: err.Error()})
-				return
-			}
-			sessions.invalidateUser(id)
-			writeWebJSON(w, http.StatusOK, webResponse{})
-			return
-		}
 		writeWebJSON(w, http.StatusNotFound, webResponse{Error: "not found"})
 	}
 }
@@ -474,18 +431,6 @@ func requireBrowserSessionSilent(request *http.Request, sessions *browserSession
 	token := sessionToken(request)
 	session, ok := sessions.get(token)
 	return session, token, ok
-}
-
-func requireSuperAdmin(w http.ResponseWriter, request *http.Request, sessions *browserSessions) (browserSession, string, bool) {
-	session, token, ok := requireBrowserSession(w, request, sessions)
-	if !ok {
-		return browserSession{}, "", false
-	}
-	if session.User.Role != superAdminRole {
-		writeWebJSON(w, http.StatusForbidden, webResponse{Error: "super administrator access required"})
-		return browserSession{}, "", false
-	}
-	return session, token, true
 }
 
 func requireUnlockedVault(w http.ResponseWriter, request *http.Request, app *App, sessions *browserSessions) (browserSession, string, bool) {

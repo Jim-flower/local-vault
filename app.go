@@ -17,6 +17,7 @@ type App struct {
 	store         *Store
 	webSessions   *browserSessions
 	webSessionsMu sync.Mutex
+	loginTwoFA    loginTwoFA
 }
 
 func NewApp() *App { return &App{} }

@@ -43,6 +43,10 @@ func runWebMode(app *App, host string, port, remoteVaultPort int, openBrowser, a
 	if err != nil {
 		return err
 	}
+	app.loginTwoFA, err = loadLoginTwoFA()
+	if err != nil {
+		return err
+	}
 	app.startup(webStartupContext())
 	defer app.shutdown(webStartupContext())
 	if app.store == nil {

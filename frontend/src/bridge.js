@@ -80,18 +80,13 @@ export const GetAuthStatus = async () => {
   if (inWails()) return null
   return auth('/status')
 }
-export const BootstrapAdmin = (username, password, masterPassword) => auth('/bootstrap', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, masterPassword }),
+export const BootstrapAdmin = (password, masterPassword, code) => auth('/bootstrap', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: "admin", password, masterPassword, code }),
 })
-export const Login = (username, password) => auth('/login', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
+export const Login = (password, code) => auth('/login', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: "admin", password, code }),
 })
 export const Logout = () => auth('/logout', { method: 'POST' })
-export const ListUsers = () => auth('/users')
-export const CreateUser = (username, password) => auth('/users/create', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }),
-})
-export const RemoveUser = id => auth(`/users/${id}`, { method: 'DELETE' })
 export const IsUnlocked = () => invoke('IsUnlocked', [])
 export const Initialize = (...args) => invoke('Initialize', args)
 export const Unlock = (...args) => invoke('Unlock', args)
