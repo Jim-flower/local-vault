@@ -45,3 +45,6 @@ export function SearchEntries(arg1:string):Promise<Array<main.Entry>>;
 export function Unlock(arg1:string):Promise<void>;
 
 export function UpdateEntry(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string,arg6:string,arg7:string,arg8:string):Promise<void>;
+
+export function SaveVaultEntry(arg1:string,arg2:main.Entry):Promise<void>;
+export function ExportSSHPrivateKey(arg1:string):Promise<boolean>;

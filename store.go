@@ -68,34 +68,38 @@ type Category struct {
 }
 
 type Entry struct {
-	ID           int64  `json:"ID"`
-	CategoryID   int64  `json:"CategoryID"`
-	CategoryName string `json:"CategoryName"`
-	Name         string `json:"Name"`
-	Username     string `json:"Username"`
-	Password     string `json:"Password"`
-	URL          string `json:"URL"`
-	Notes        string `json:"Notes"`
-	TOTPSecret   string `json:"TOTPSecret"`
-	CreatedAt    string `json:"CreatedAt"`
-	UpdatedAt    string `json:"UpdatedAt"`
+	Type         string         `json:"Type"`
+	SSH          *SSHConnection `json:"SSH,omitempty"`
+	ID           int64          `json:"ID"`
+	CategoryID   int64          `json:"CategoryID"`
+	CategoryName string         `json:"CategoryName"`
+	Name         string         `json:"Name"`
+	Username     string         `json:"Username"`
+	Password     string         `json:"Password"`
+	URL          string         `json:"URL"`
+	Notes        string         `json:"Notes"`
+	TOTPSecret   string         `json:"TOTPSecret"`
+	CreatedAt    string         `json:"CreatedAt"`
+	UpdatedAt    string         `json:"UpdatedAt"`
 }
 
 // EntryHistory is an encrypted snapshot taken immediately before an entry is
 // edited. It lets the user inspect previous values without affecting the live
 // entry.
 type EntryHistory struct {
-	ID           int64  `json:"ID"`
-	EntryID      int64  `json:"EntryID"`
-	CategoryName string `json:"CategoryName"`
-	Name         string `json:"Name"`
-	Username     string `json:"Username"`
-	Password     string `json:"Password"`
-	URL          string `json:"URL"`
-	Notes        string `json:"Notes"`
-	TOTPSecret   string `json:"TOTPSecret"`
-	CreatedAt    string `json:"CreatedAt"`
-	ArchivedAt   string `json:"ArchivedAt"`
+	Type         string         `json:"Type"`
+	SSH          *SSHConnection `json:"SSH,omitempty"`
+	ID           int64          `json:"ID"`
+	EntryID      int64          `json:"EntryID"`
+	CategoryName string         `json:"CategoryName"`
+	Name         string         `json:"Name"`
+	Username     string         `json:"Username"`
+	Password     string         `json:"Password"`
+	URL          string         `json:"URL"`
+	Notes        string         `json:"Notes"`
+	TOTPSecret   string         `json:"TOTPSecret"`
+	CreatedAt    string         `json:"CreatedAt"`
+	ArchivedAt   string         `json:"ArchivedAt"`
 }
 
 type Store struct {
@@ -133,6 +137,22 @@ func OpenStore(path string) (*Store, error) {
 }
 
 func runMigrations(db *sql.DB) error {
+	for _, table := range []string{"entries", "entry_history"} {
+		for _, column := range []struct{ name, definition string }{
+			{"entry_type", "TEXT NOT NULL DEFAULT 'password'"},
+			{"ssh_config", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			var count int
+			if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", table, column.name).Scan(&count); err != nil {
+				return err
+			}
+			if count == 0 {
+				if _, err := db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column.name + " " + column.definition); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	// Seed default categories once
 	var n int
 	db.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&n)
@@ -352,7 +372,7 @@ func (s *Store) DeleteCategory(id int64) error {
 
 const entrySelect = `
 	SELECT e.id, e.category_id, COALESCE(c.name,'') AS cat_name,
-	       e.name, e.username, e.password, e.url, e.notes, e.totp_secret, e.created_at, e.updated_at
+	       e.name, e.username, e.password, e.url, e.notes, e.totp_secret, e.created_at, e.updated_at, e.entry_type, e.ssh_config
 	FROM entries e
 	LEFT JOIN categories c ON e.category_id = c.id`
 
@@ -381,16 +401,25 @@ func (s *Store) SearchEntries(query string) ([]*Entry, error) {
 	if s.key == nil {
 		return nil, errors.New("vault is locked")
 	}
-	like := "%" + query + "%"
-	rows, err := s.db.Query(
-		entrySelect+" WHERE e.name LIKE ? OR e.username LIKE ? OR e.url LIKE ? ORDER BY e.name",
-		like, like, like,
-	)
+	entries, err := s.ListEntries(0)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return s.collectEntries(rows)
+	query = strings.ToLower(query)
+	result := make([]*Entry, 0)
+	for _, e := range entries {
+		fields := []string{e.Name, e.Username, e.URL}
+		if e.SSH != nil {
+			fields = append(fields, e.SSH.Host)
+		}
+		for _, field := range fields {
+			if strings.Contains(strings.ToLower(field), query) {
+				result = append(result, e)
+				break
+			}
+		}
+	}
+	return result, nil
 }
 
 func (s *Store) GetEntry(name string) (*Entry, error) {
@@ -421,33 +450,44 @@ func (s *Store) getEntryByID(id int64) (*Entry, error) {
 }
 
 func (s *Store) AddEntry(categoryID int64, name, username, password, url, notes, totpSecret string) error {
+	return s.AddEntryRecord(&Entry{CategoryID: categoryID, Name: name, Username: username, Password: password, URL: url, Notes: notes, TOTPSecret: totpSecret})
+}
+
+func (s *Store) AddEntryRecord(e *Entry) error {
 	if s.key == nil {
 		return errors.New("vault is locked")
 	}
-	encPass, err := s.encryptField(password)
+	if err := normalizeEntry(e); err != nil {
+		return err
+	}
+	password, err := s.encryptField(e.Password)
 	if err != nil {
 		return err
 	}
-	encNotes, err := s.encryptField(notes)
+	notes, err := s.encryptField(e.Notes)
 	if err != nil {
 		return err
 	}
-	encTOTP, err := s.encryptField(totpSecret)
+	totp, err := s.encryptField(e.TOTPSecret)
+	if err != nil {
+		return err
+	}
+	ssh, err := s.encryptSSH(e.SSH)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Format(time.RFC3339)
-	_, err = s.db.Exec(
-		`INSERT INTO entries (category_id,name,username,password,url,notes,totp_secret,created_at,updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?)`,
-		categoryID, name, username, encPass, url, encNotes, encTOTP, now, now,
-	)
+	_, err = s.db.Exec(`INSERT INTO entries (category_id,name,username,password,url,notes,totp_secret,created_at,updated_at,entry_type,ssh_config)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`, e.CategoryID, e.Name, e.Username, password, e.URL, notes, totp, now, now, e.Type, ssh)
 	return err
 }
 
 func (s *Store) SaveEntry(e *Entry) error {
 	if s.key == nil {
 		return errors.New("vault is locked")
+	}
+	if err := normalizeEntry(e); err != nil {
+		return err
 	}
 	previous, err := s.getEntryByID(e.ID)
 	if err != nil {
@@ -473,10 +513,14 @@ func (s *Store) SaveEntry(e *Entry) error {
 	if err != nil {
 		return err
 	}
+	ssh, err := s.encryptSSH(e.SSH)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Format(time.RFC3339)
 	_, err = tx.Exec(
-		`UPDATE entries SET category_id=?,name=?,username=?,password=?,url=?,notes=?,totp_secret=?,updated_at=? WHERE id=?`,
-		e.CategoryID, e.Name, e.Username, encPass, e.URL, encNotes, encTOTP, now, e.ID,
+		`UPDATE entries SET category_id=?,name=?,username=?,password=?,url=?,notes=?,totp_secret=?,updated_at=?,entry_type=?,ssh_config=? WHERE id=?`,
+		e.CategoryID, e.Name, e.Username, encPass, e.URL, encNotes, encTOTP, now, e.Type, ssh, e.ID,
 	)
 	if err != nil {
 		return err
@@ -497,11 +541,15 @@ func (s *Store) saveEntryHistory(tx *sql.Tx, entry *Entry) error {
 	if err != nil {
 		return err
 	}
+	ssh, err := s.encryptSSH(entry.SSH)
+	if err != nil {
+		return err
+	}
 	_, err = tx.Exec(`INSERT INTO entry_history
-		(entry_id,category_name,name,username,password,url,notes,totp_secret,created_at,archived_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		(entry_id,category_name,name,username,password,url,notes,totp_secret,created_at,archived_at,entry_type,ssh_config)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		entry.ID, entry.CategoryName, entry.Name, entry.Username, password, entry.URL, notes, totpSecret,
-		entry.CreatedAt, time.Now().Format(time.RFC3339),
+		entry.CreatedAt, time.Now().Format(time.RFC3339), entry.Type, ssh,
 	)
 	return err
 }
@@ -511,7 +559,7 @@ func (s *Store) GetEntryHistory(entryName string) ([]*EntryHistory, error) {
 		return nil, errors.New("vault is locked")
 	}
 	rows, err := s.db.Query(`SELECT h.id, h.entry_id, h.category_name, h.name, h.username, h.password,
-		h.url, h.notes, h.totp_secret, h.created_at, h.archived_at
+		h.url, h.notes, h.totp_secret, h.created_at, h.archived_at, h.entry_type, h.ssh_config
 		FROM entry_history h JOIN entries e ON e.id=h.entry_id
 		WHERE e.name=? ORDER BY h.archived_at DESC, h.id DESC`, entryName)
 	if err != nil {
@@ -522,9 +570,9 @@ func (s *Store) GetEntryHistory(entryName string) ([]*EntryHistory, error) {
 	var history []*EntryHistory
 	for rows.Next() {
 		var snapshot EntryHistory
-		var password, notes, totpSecret string
+		var password, notes, totpSecret, ssh string
 		if err := rows.Scan(&snapshot.ID, &snapshot.EntryID, &snapshot.CategoryName, &snapshot.Name,
-			&snapshot.Username, &password, &snapshot.URL, &notes, &totpSecret, &snapshot.CreatedAt, &snapshot.ArchivedAt); err != nil {
+			&snapshot.Username, &password, &snapshot.URL, &notes, &totpSecret, &snapshot.CreatedAt, &snapshot.ArchivedAt, &snapshot.Type, &ssh); err != nil {
 			return nil, err
 		}
 		if snapshot.Password, err = s.decryptField(password); err != nil {
@@ -535,6 +583,9 @@ func (s *Store) GetEntryHistory(entryName string) ([]*EntryHistory, error) {
 		}
 		if snapshot.TOTPSecret, err = s.decryptField(totpSecret); err != nil {
 			return nil, fmt.Errorf("decrypt history totp_secret: %w", err)
+		}
+		if snapshot.SSH, err = s.decryptSSH(ssh); err != nil {
+			return nil, fmt.Errorf("decrypt SSH history: %w", err)
 		}
 		history = append(history, &snapshot)
 	}
@@ -627,10 +678,10 @@ type rowScanner interface{ Scan(dest ...any) error }
 
 func (s *Store) scanEntry(row rowScanner) (*Entry, error) {
 	var e Entry
-	var passHex, notesHex, totpHex string
+	var passHex, notesHex, totpHex, sshHex string
 	if err := row.Scan(&e.ID, &e.CategoryID, &e.CategoryName,
 		&e.Name, &e.Username, &passHex, &e.URL, &notesHex, &totpHex,
-		&e.CreatedAt, &e.UpdatedAt); err != nil {
+		&e.CreatedAt, &e.UpdatedAt, &e.Type, &sshHex); err != nil {
 		return nil, err
 	}
 	var err error
@@ -642,6 +693,9 @@ func (s *Store) scanEntry(row rowScanner) (*Entry, error) {
 	}
 	if e.TOTPSecret, err = s.decryptField(totpHex); err != nil {
 		return nil, fmt.Errorf("decrypt totp_secret: %w", err)
+	}
+	if e.SSH, err = s.decryptSSH(sshHex); err != nil {
+		return nil, fmt.Errorf("decrypt SSH: %w", err)
 	}
 	return &e, nil
 }

@@ -344,6 +344,9 @@ func callWebAPI(app *App, method string, args []json.RawMessage) (any, error) {
 		return callOneInt(args, app.GeneratePassword)
 	case "DeleteEntries":
 		return nil, decodeCall(args, &items, &text, func() error { return app.DeleteEntries(items, text) })
+	case "SaveVaultEntry":
+		var input Entry
+		return nil, decodeCall(args, &text, &input, func() error { return app.SaveVaultEntry(text, input) })
 	case "AddEntry":
 		return nil, decodeCall(args, &id, &text, &textTwo, &textThree, &textFour, &textFive, &textSix, func() error { return app.AddEntry(id, text, textTwo, textThree, textFour, textFive, textSix) })
 	case "UpdateEntry":

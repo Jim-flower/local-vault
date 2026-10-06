@@ -77,3 +77,6 @@ export function Unlock(arg1) {
 export function UpdateEntry(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
   return window['go']['main']['App']['UpdateEntry'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
 }
+
+export function SaveVaultEntry(arg1, arg2) { return window['go']['main']['App']['SaveVaultEntry'](arg1, arg2); }
+export function ExportSSHPrivateKey(arg1) { return window['go']['main']['App']['ExportSSHPrivateKey'](arg1); }

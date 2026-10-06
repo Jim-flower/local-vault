@@ -646,3 +646,10 @@ body {
   .lock-card { margin: auto 0; padding: 30px 22px; border-radius: 8px; }
   .lock-card h1 { font-size: 1.25rem; }
 }
+
+.ssh-badge { margin-left: 8px; color: var(--text-3); font-size: .65rem; }
+.ssh-key-value { flex-direction: column; align-items: stretch; min-width: 0; }
+.ssh-key-value pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; font-size: .75rem; margin: 0; }
+.ssh-actions { display: flex; gap: 6px; }
+.ssh-hint, .field small { font-size: .72rem; color: var(--text-3); line-height: 1.5; }
+.ssh-details .vr-val { overflow-wrap: anywhere; min-width: 0; }

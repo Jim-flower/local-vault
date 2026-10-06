@@ -15,7 +15,7 @@ import (
 
 const (
 	exportFileName      = "vault-export.json"
-	exportFormatVersion = 1
+	exportFormatVersion = 2
 	maxImportSize       = 10 << 20 // 10 MiB of uncompressed JSON
 )
 
@@ -34,15 +34,17 @@ type ExportCategory struct {
 }
 
 type ExportEntry struct {
-	CategoryName string `json:"categoryName"`
-	Name         string `json:"name"`
-	Username     string `json:"username"`
-	Password     string `json:"password"`
-	URL          string `json:"url"`
-	Notes        string `json:"notes"`
-	TOTPSecret   string `json:"totpSecret"`
-	CreatedAt    string `json:"createdAt"`
-	UpdatedAt    string `json:"updatedAt"`
+	Type         string         `json:"type"`
+	SSH          *SSHConnection `json:"ssh,omitempty"`
+	CategoryName string         `json:"categoryName"`
+	Name         string         `json:"name"`
+	Username     string         `json:"username"`
+	Password     string         `json:"password"`
+	URL          string         `json:"url"`
+	Notes        string         `json:"notes"`
+	TOTPSecret   string         `json:"totpSecret"`
+	CreatedAt    string         `json:"createdAt"`
+	UpdatedAt    string         `json:"updatedAt"`
 }
 
 type ExportResult struct {
@@ -84,6 +86,7 @@ func (s *Store) ExportToZIP(path, password string) (int, error) {
 	}
 	for _, entry := range entries {
 		payload.Entries = append(payload.Entries, ExportEntry{
+			Type: entry.Type, SSH: entry.SSH,
 			CategoryName: entry.CategoryName,
 			Name:         entry.Name,
 			Username:     entry.Username,
@@ -184,7 +187,7 @@ func (s *Store) ImportFromZIP(path, password string) (*ImportResult, error) {
 }
 
 func validateImportPayload(payload *VaultExport) error {
-	if payload.FormatVersion != exportFormatVersion {
+	if payload.FormatVersion != 1 && payload.FormatVersion != exportFormatVersion {
 		return fmt.Errorf("unsupported export format version %d", payload.FormatVersion)
 	}
 	categoryNames := make(map[string]struct{}, len(payload.Categories))
@@ -200,9 +203,11 @@ func validateImportPayload(payload *VaultExport) error {
 		entry := &payload.Entries[i]
 		entry.Name = strings.TrimSpace(entry.Name)
 		entry.CategoryName = strings.TrimSpace(entry.CategoryName)
-		if entry.Name == "" || entry.Password == "" {
-			return errors.New("import contains an entry without a name or password")
+		candidate := Entry{Type: entry.Type, SSH: entry.SSH, Name: entry.Name, Username: entry.Username, Password: entry.Password}
+		if err := normalizeEntry(&candidate); err != nil {
+			return fmt.Errorf("invalid imported entry: %w", err)
 		}
+		entry.Type, entry.SSH, entry.Username = candidate.Type, candidate.SSH, candidate.Username
 		if entry.CategoryName == "" {
 			entry.CategoryName = "General"
 		}
@@ -294,6 +299,10 @@ func (s *Store) saveImportedEntries(payload *VaultExport) (*ImportResult, error)
 		if err != nil {
 			return nil, err
 		}
+		ssh, err := s.encryptSSH(entry.SSH)
+		if err != nil {
+			return nil, err
+		}
 		createdAt, updatedAt := entry.CreatedAt, entry.UpdatedAt
 		if createdAt == "" {
 			createdAt = time.Now().Format(time.RFC3339)
@@ -301,8 +310,8 @@ func (s *Store) saveImportedEntries(payload *VaultExport) (*ImportResult, error)
 		if updatedAt == "" {
 			updatedAt = createdAt
 		}
-		_, err = tx.Exec(`INSERT INTO entries (category_id,name,username,password,url,notes,totp_secret,created_at,updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?)`, categoryIDs[entry.CategoryName], entry.Name, entry.Username, password, entry.URL, notes, totpSecret, createdAt, updatedAt)
+		_, err = tx.Exec(`INSERT INTO entries (category_id,name,username,password,url,notes,totp_secret,created_at,updated_at,entry_type,ssh_config)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?)`, categoryIDs[entry.CategoryName], entry.Name, entry.Username, password, entry.URL, notes, totpSecret, createdAt, updatedAt, entry.Type, ssh)
 		if err != nil {
 			return nil, err
 		}

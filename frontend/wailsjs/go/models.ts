@@ -1,4 +1,18 @@
 export namespace main {
+    export class SSHConnection {
+        Host: string;
+        Port: number;
+        PrivateKey: string;
+        Passphrase: string;
+        PublicKey: string;
+        static createFrom(source: any = {}) { return new SSHConnection(source); }
+        constructor(source: any = {}) {
+            if (typeof source === 'string') source = JSON.parse(source);
+            this.Host = source.Host; this.Port = source.Port; this.PrivateKey = source.PrivateKey;
+            this.Passphrase = source.Passphrase; this.PublicKey = source.PublicKey;
+        }
+    }
+
 	
 	export class Category {
 	    ID: number;
@@ -17,6 +31,8 @@ export namespace main {
 	    }
 	}
 	export class Entry {
+	    Type: string;
+	    SSH?: SSHConnection;
 	    ID: number;
 	    CategoryID: number;
 	    CategoryName: string;
@@ -35,6 +51,8 @@ export namespace main {
 
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Type = source["Type"];
+	        this.SSH = source["SSH"] ? new SSHConnection(source["SSH"]) : undefined;
 	        this.ID = source["ID"];
 	        this.CategoryID = source["CategoryID"];
 	        this.CategoryName = source["CategoryName"];
@@ -49,6 +67,8 @@ export namespace main {
 	    }
 	}
 	export class EntryHistory {
+	    Type: string;
+	    SSH?: SSHConnection;
 	    ID: number;
 	    EntryID: number;
 	    CategoryName: string;
@@ -67,6 +87,8 @@ export namespace main {
 
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Type = source["Type"];
+	        this.SSH = source["SSH"] ? new SSHConnection(source["SSH"]) : undefined;
 	        this.ID = source["ID"];
 	        this.EntryID = source["EntryID"];
 	        this.CategoryName = source["CategoryName"];

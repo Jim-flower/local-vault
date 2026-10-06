@@ -6,7 +6,7 @@ import {
   GetAuthStatus, BootstrapAdmin, Login, Logout,
   withBasePath,
   GetCategories, AddCategory, DeleteCategory,
-  ListEntries, SearchEntries, AddEntry, UpdateEntry, DeleteEntries,
+  ListEntries, SearchEntries, SaveVaultEntry, ExportSSHPrivateKey, DeleteEntries,
   GeneratePassword, GetTOTPCode, GetEntryHistory, ExportVault, ImportVault,
 } from './bridge'
 
@@ -261,13 +261,12 @@ function VaultScreen({ user, onLogout, onLock }) {
   // ── entry actions ──
   async function handleSave(data, oldName) {
     try {
-      if (oldName) {
-        await UpdateEntry(oldName, data.categoryID, data.name, data.username, data.password, data.url, data.notes, data.totpSecret)
-        flash('Entry updated')
-      } else {
-        await AddEntry(data.categoryID, data.name, data.username, data.password, data.url, data.notes, data.totpSecret)
-        flash('Entry added')
-      }
+      await SaveVaultEntry(oldName || '', {
+        CategoryID: data.categoryID, Name: data.name, Username: data.username,
+        Password: data.password, URL: data.url, Notes: data.notes, TOTPSecret: data.totpSecret,
+        Type: data.type, SSH: data.type === 'ssh' ? data.ssh : null,
+      })
+      flash(oldName ? 'Entry updated' : 'Entry added')
       setModal(null); loadEntries(); loadCategories()
     } catch (err) { alert(String(err)) }
   }
@@ -436,7 +435,7 @@ function VaultScreen({ user, onLogout, onLock }) {
                   </th>
                   <th>Name</th>
                   <th>Username</th>
-                  <th>URL</th>
+                  <th>URL / SSH host</th>
                   {activeCat === 0 && <th>Category</th>}
                   <th />
                 </tr>
@@ -455,11 +454,11 @@ function VaultScreen({ user, onLogout, onLock }) {
                     <td>
                       <div className="name-cell">
                         <Avatar name={e.Name} size={30} />
-                        <span className="entry-name-text">{e.Name}</span>
+                        <span className="entry-name-text">{e.Name}{e.Type === 'ssh' && <small className="ssh-badge">SSH</small>}</span>
                       </div>
                     </td>
                     <td className="cell-muted">{e.Username || '—'}</td>
-                    <td className="cell-muted cell-url">{e.URL || '—'}</td>
+                    <td className="cell-muted cell-url">{e.SSH ? `${e.SSH.Host}:${e.SSH.Port}` : e.URL || '—'}</td>
                     {activeCat === 0 && (
                       <td>
                         <span className="cat-pill" style={{ background: catColor(e.CategoryName) + '22', color: catColor(e.CategoryName) }}>
@@ -470,9 +469,9 @@ function VaultScreen({ user, onLogout, onLock }) {
                     <td className="cell-action" onClick={ev => ev.stopPropagation()}>
                       <button
                         className="copy-btn"
-                        title="Copy password"
+                        title={e.Type === 'ssh' ? "Copy SSH command" : "Copy password"}
                         onClick={async () => {
-                          try { await copyText(e.Password); flash('Password copied') }
+                          try { await copyText(e.Type === 'ssh' ? sshCommand(e) : e.Password); flash(e.Type === 'ssh' ? 'SSH command copied' : 'Password copied') }
                           catch { flash('Could not copy password') }
                         }}
                       >
@@ -690,6 +689,8 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
   const isEdit = mode === 'edit'
 
   const [form, setForm] = useState({
+    type: entry?.Type || 'password',
+    ssh: { Host: '', Port: 22, PrivateKey: '', Passphrase: '', PublicKey: '', ...entry?.SSH },
     categoryID:  entry?.CategoryID  || defaultCategoryID,
     name:        entry?.Name        || '',
     username:    entry?.Username    || '',
@@ -739,6 +740,17 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
   }
 
   function set(k)    { return e => setForm(f => ({ ...f, [k]: e.target.value })) }
+  function setSSH(k) { return e => setForm(f => ({ ...f, ssh: { ...f.ssh, [k]: k === 'Port' ? Number(e.target.value) : e.target.value } })) }
+
+  async function importKey(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    if (file.size > 1024 * 1024) { setError('Key file must be smaller than 1 MiB'); return }
+    try { const key = await file.text(); setForm(f => ({ ...f, ssh: { ...f.ssh, PrivateKey: key } })); setError('') }
+    catch { setError('Could not read key file') }
+    e.target.value = ''
+  }
+
   function setInt(k) { return e => setForm(f => ({ ...f, [k]: parseInt(e.target.value) || 0 })) }
 
   async function gen() {
@@ -751,7 +763,7 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
   async function submit(e) {
     e.preventDefault(); setError('')
     if (!form.name.trim())     { setError('Name is required');     return }
-    if (!form.password.trim()) { setError('Password is required'); return }
+    if (form.type === 'password' && !form.password.trim()) { setError('Password is required'); return }
     await onSave(form, isEdit ? entry.Name : null)
   }
 
@@ -791,15 +803,19 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
         {/* View body */}
         {isView && (
           <div className="modal-body">
+            {entry.Type === 'ssh' && <SSHDetails entry={entry} onCopy={copy} onExport={async () => {
+              try { if (await ExportSSHPrivateKey(entry)) flash('Private key exported') }
+              catch (err) { flash(String(err)) }
+            }} />}
             {entry.Username && <ViewRow label="Username" value={entry.Username} onCopy={() => copy(entry.Username, 'Username')} />}
-            <div className="view-row">
+            {(entry.Type !== 'ssh' || entry.Password) && <div className="view-row">
               <span className="vr-label">Password</span>
               <div className="vr-val">
                 <span className="mono flex-1">{showPw ? entry.Password : '••••••••••••'}</span>
                 <button className="icon-btn dark" onClick={() => setShowPw(v => !v)}>{showPw ? '🙈' : '👁'}</button>
                 <button className="icon-btn dark" onClick={() => copy(entry.Password, 'Password')}>📋</button>
               </div>
-            </div>
+            </div>}
             {entry.URL && <ViewRow label="URL" value={entry.URL} onCopy={() => copy(entry.URL, 'URL')} />}
             {entry.Notes && <ViewRow label="Notes" value={entry.Notes} />}
             {entry.TOTPSecret && totpCode && (
@@ -839,16 +855,20 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
         {!isView && (
           <form className="modal-body" onSubmit={submit}>
             <div className="field">
+              <label>Entry type</label>
+              <select value={form.type} onChange={set('type')}><option value="password">Password</option><option value="ssh">SSH connection</option></select>
+            </div>
+            <div className="field">
               <label>Category</label>
               <select value={form.categoryID} onChange={setInt('categoryID')}>
                 {categories.map(c => <option key={c.ID} value={c.ID}>{c.Name}</option>)}
               </select>
             </div>
             <Field label="Name *"   value={form.name}     onChange={set('name')}     placeholder="e.g. GitHub" autoFocus />
-            <Field label="Username" value={form.username} onChange={set('username')} placeholder="user@example.com" />
+            <Field label={form.type === 'ssh' ? 'Username *' : 'Username'} value={form.username} onChange={set('username')} placeholder={form.type === 'ssh' ? 'e.g. deploy' : 'user@example.com'} />
 
             <div className="field">
-              <label>Password *</label>
+              <label>{form.type === 'ssh' ? 'Login password (optional)' : 'Password *'}</label>
               <div className="pw-row">
                 <input type={showPw ? 'text' : 'password'} value={form.password}
                   onChange={set('password')} placeholder="Enter or generate" />
@@ -861,7 +881,15 @@ function EntryModal({ mode, entry, categories, defaultCategoryID, onSave, onDele
               </div>
             </div>
 
-            <Field label="URL"   value={form.url}   onChange={set('url')}   placeholder="https://" />
+            {form.type === 'ssh' ? <>
+              <Field label="Host / IP *" value={form.ssh.Host} onChange={setSSH('Host')} placeholder="server.example.com" />
+              <Field label="Port *" type="number" value={form.ssh.Port} onChange={setSSH('Port')} />
+              <Field label="Private key (optional)" value={form.ssh.PrivateKey} onChange={setSSH('PrivateKey')} textarea placeholder="Paste the complete OpenSSH / PEM private key, including header and footer" />
+              <div className="field"><label>Import private key file</label><input type="file" onChange={importKey} /><small>Keys stay encrypted in the vault. Existing key encryption and passphrases are preserved.</small></div>
+              <Field label="Key passphrase (optional)" type="password" value={form.ssh.Passphrase} onChange={setSSH('Passphrase')} />
+              <Field label="Public key (optional)" value={form.ssh.PublicKey} onChange={setSSH('PublicKey')} textarea />
+            </> : <Field label="URL" value={form.url} onChange={set('url')} placeholder="https://" />}
+
             <Field label="Notes" value={form.notes} onChange={set('notes')} textarea placeholder="Optional notes…" />
 
             <div className="field">
@@ -907,6 +935,7 @@ function HistorySnapshot({ snapshot }) {
         <ViewRow label="Category" value={snapshot.CategoryName} />
         <ViewRow label="Name" value={snapshot.Name} />
         <ViewRow label="Username" value={snapshot.Username} />
+        {snapshot.Type === 'ssh' && <SSHDetails entry={snapshot} />}
         <div className="view-row">
           <span className="vr-label">Password</span>
           <div className="vr-val">
@@ -920,6 +949,35 @@ function HistorySnapshot({ snapshot }) {
       </div>
     </details>
   )
+}
+
+function sshCommand(entry) {
+  const ssh = entry.SSH
+  return `ssh -p ${ssh.Port}${ssh.PrivateKey ? ` -i ./id_vault_${entry.ID}` : ''} ${entry.Username}@${ssh.Host}`
+}
+
+function SSHDetails({ entry, onCopy, onExport }) {
+  const [showKey, setShowKey] = useState(false)
+  const [showPassphrase, setShowPassphrase] = useState(false)
+  const ssh = entry.SSH
+  if (!ssh) return null
+  return <div className="ssh-details">
+    <ViewRow label="SSH host" value={`${ssh.Host}:${ssh.Port}`} />
+    {onCopy && <ViewRow label="Command" value={sshCommand(entry)} onCopy={() => onCopy(sshCommand(entry), 'SSH command')} />}
+    {ssh.PrivateKey && <div className="view-row"><span className="vr-label">Private key</span><div className="vr-val ssh-key-value">
+      <pre>{showKey ? ssh.PrivateKey : '••••••••••••'}</pre>
+      <div className="ssh-actions"><button className="btn btn-ghost btn-sm" onClick={() => setShowKey(v => !v)}>{showKey ? 'Hide' : 'Show'}</button>
+      {onCopy && <button className="btn btn-ghost btn-sm" onClick={() => onCopy(ssh.PrivateKey, 'Private key')}>Copy</button>}
+      {onExport && <button className="btn btn-ghost btn-sm" onClick={onExport}>Export key</button>}</div>
+    </div></div>}
+    {ssh.Passphrase && <div className="view-row"><span className="vr-label">Key passphrase</span><div className="vr-val">
+      <span className="mono flex-1">{showPassphrase ? ssh.Passphrase : '••••••••'}</span>
+      <button className="btn btn-ghost btn-sm" onClick={() => setShowPassphrase(v => !v)}>{showPassphrase ? 'Hide' : 'Show'}</button>
+      {onCopy && <button className="icon-btn dark" onClick={() => onCopy(ssh.Passphrase, 'Key passphrase')}>📋</button>}
+    </div></div>}
+    {ssh.PublicKey && <ViewRow label="Public key" value={ssh.PublicKey} onCopy={onCopy ? () => onCopy(ssh.PublicKey, 'Public key') : undefined} />}
+    {onExport && ssh.PrivateKey && <p className="ssh-hint">Export writes a private key file outside the vault. Place it in your terminal’s working directory for the command above, or update the -i path. On Linux/macOS run chmod 600 on the key file.</p>}
+  </div>
 }
 
 function ViewRow({ label, value, onCopy }) {

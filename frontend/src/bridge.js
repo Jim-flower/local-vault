@@ -97,6 +97,12 @@ export const RenameCategory = (...args) => invoke('RenameCategory', args)
 export const DeleteCategory = (...args) => invoke('DeleteCategory', args)
 export const ListEntries = (...args) => invoke('ListEntries', args)
 export const SearchEntries = (...args) => invoke('SearchEntries', args)
+export const SaveVaultEntry = (...args) => invoke('SaveVaultEntry', args)
+export const ExportSSHPrivateKey = async entry => {
+  if (inWails()) return wails.ExportSSHPrivateKey(entry.Name)
+  downloadBlob(new Blob([entry.SSH.PrivateKey], { type: 'application/octet-stream' }), `id_vault_${entry.ID}`)
+  return true
+}
 export const AddEntry = (...args) => invoke('AddEntry', args)
 export const UpdateEntry = (...args) => invoke('UpdateEntry', args)
 export const DeleteEntries = (...args) => invoke('DeleteEntries', args)
